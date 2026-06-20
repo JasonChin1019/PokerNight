@@ -1,0 +1,80 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .input {
+    @apply h-[50px] w-full rounded-xl border border-white/10 bg-field px-4 text-base font-semibold text-cream outline-none placeholder:text-muted-2 focus:border-amber/50;
+  }
+}
+
+:root {
+  color-scheme: dark;
+}
+
+/* Tactile press feedback on every button. */
+button {
+  transition: transform 0.08s ease;
+}
+button:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #0c120e;
+  color: #f1ede4;
+  font-family: "Manrope", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The turn-timer countdown ring. Duration is set inline via --pn-turn. */
+@keyframes pn-count {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: 176;
+  }
+}
+
+/* Showdown auto-advance progress bar. */
+@keyframes pn-bar {
+  from {
+    width: 100%;
+  }
+  to {
+    width: 0%;
+  }
+}
+
+/* Thin, dark scrollbars to match the felt aesthetic. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Hide number-input spinners — chip amounts use custom steppers. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}

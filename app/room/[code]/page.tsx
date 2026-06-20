@@ -1,0 +1,2291 @@
+"use client";
+
+import { useParams } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import QRCode from "qrcode";
+import { getSocket, getSessionId, getNickname } from "@/lib/client/socket";
+import { PlayingCard, CardBack } from "@/components/Card";
+import { WinAnimation } from "@/components/WinAnimation";
+import { getAnimationTier } from "@/lib/poker/animation";
+import type {
+  RoomSnapshot,
+  PublicSeat,
+  HandResultPayload,
+  CheekyPrediction,
+  CheekyBetRequestPayload,
+  CheekyBetSettledPayload,
+  CardPeekRequestEventPayload,
+  CardPeekResultPayload,
+  SessionRecapPayload,
+} from "@/lib/poker/types";
+
+const fmt = (n: number) => n.toLocaleString("en-US");
+
+const AVATAR_COLORS = [
+  "#3f8fd0",
+  "#c77dba",
+  "#6db86d",
+  "#d4654f",
+  "#5bb5b0",
+  "#b08968",
+  "#9a86d4",
+  "#d0a13f",
+  "#5f9ea0",
+];
+function colorFor(name: string) {
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+function initials(name: string) {
+  const parts = name.trim().split(/\s+/);
+  return ((parts[0]?.[0] ?? "") + (parts[1]?.[0] ?? parts[0]?.[1] ?? "")).toUpperCase();
+}
+
+export default function RoomPage() {
+  const params = useParams<{ code: string }>();
+  const router = useRouter();
+  const code = (params.code || "").toUpperCase();
+
+  const [snap, setSnap] = useState<RoomSnapshot | null>(null);
+  const [result, setResult] = useState<HandResultPayload | null>(null);
+  const [equity, setEquity] = useState<Record<number, number>>({});
+  const [toast, setToast] = useState("");
+  const [now, setNow] = useState(Date.now());
+  const [showTip, setShowTip] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [showCheeky, setShowCheeky] = useState(false);
+  const [cheekyIncoming, setCheekyIncoming] = useState<CheekyBetRequestPayload | null>(null);
+  const [cheekySettled, setCheekySettled] = useState<CheekyBetSettledPayload | null>(null);
+  const [peekTarget, setPeekTarget] = useState<number | null>(null);
+  const [peekIncoming, setPeekIncoming] = useState<CardPeekRequestEventPayload | null>(null);
+  const [peekReveal, setPeekReveal] = useState<CardPeekResultPayload | null>(null);
+  const [recap, setRecap] = useState<SessionRecapPayload | null>(null);
+  const [tip, setTip] = useState<{ from: string; amount: number } | null>(null);
+  // per-seat action chat bubbles (fold/call/bet/raise/all-in), cleared after 2s
+  const [actions, setActions] = useState<
+    Record<number, { type: string; amount: number; id: number }>
+  >({});
+
+  // ---- socket wiring ----
+  useEffect(() => {
+    const socket = getSocket();
+    const role =
+      new URLSearchParams(window.location.search).get("role") === "spectator"
+        ? "spectator"
+        : "player";
+    const join = () =>
+      socket.emit("join_room", {
+        roomCode: code,
+        nickname: getNickname() || "Player",
+        sessionId: getSessionId(),
+        role,
+      });
+
+    socket.on("connect", join);
+    if (socket.connected) join();
+
+    socket.on("room_state", (s: RoomSnapshot) => {
+      setSnap(s);
+      if (s.round !== "waiting") setResult(null); // new hand cleared the overlay
+    });
+    socket.on("equity_update", (p: { perSeatWinPct: Record<number, number> }) =>
+      setEquity(p.perSeatWinPct)
+    );
+    socket.on("hand_result", (r: HandResultPayload) => {
+      setResult(r);
+    });
+    socket.on("error", (e: { message: string }) => {
+      setToast(e.message);
+      setTimeout(() => setToast(""), 3000);
+    });
+
+    socket.on("cheeky_bet_request", (p: CheekyBetRequestPayload) =>
+      setCheekyIncoming(p)
+    );
+    socket.on("cheeky_bet_settled", (p: CheekyBetSettledPayload) => {
+      setCheekySettled(p);
+      setCheekyIncoming(null);
+      setShowCheeky(false);
+    });
+    socket.on("card_peek_request", (p: CardPeekRequestEventPayload) =>
+      setPeekIncoming(p)
+    );
+    socket.on("card_peek_result", (p: CardPeekResultPayload) => {
+      setPeekReveal(p);
+      setPeekTarget(null);
+    });
+    socket.on("session_recap", (p: SessionRecapPayload) => setRecap(p));
+
+    socket.on("tip_received", (p: { from: string; amount: number }) => {
+      setTip(p);
+      setTimeout(() => setTip(null), 4000);
+    });
+
+    socket.on(
+      "player_acted",
+      (p: { seatIndex: number; type: string; amount: number }) => {
+        const id = Date.now() + Math.random();
+        setActions((a) => ({ ...a, [p.seatIndex]: { type: p.type, amount: p.amount, id } }));
+        setTimeout(() => {
+          setActions((a) => {
+            if (a[p.seatIndex]?.id !== id) return a; // a newer action replaced it
+            const next = { ...a };
+            delete next[p.seatIndex];
+            return next;
+          });
+        }, 2000);
+      }
+    );
+
+    return () => {
+      socket.off("connect", join);
+      socket.off("room_state");
+      socket.off("equity_update");
+      socket.off("hand_result");
+      socket.off("error");
+      socket.off("cheeky_bet_request");
+      socket.off("cheeky_bet_settled");
+      socket.off("card_peek_request");
+      socket.off("card_peek_result");
+      socket.off("session_recap");
+      socket.off("tip_received");
+      socket.off("player_acted");
+    };
+  }, [code]);
+
+  // tick for the turn countdown
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, []);
+
+  const emit = (event: string, payload?: unknown) => {
+    navigator.vibrate?.(10); // haptic press feedback where supported
+    getSocket().emit(event, payload);
+  };
+
+  if (!snap) return <Waking />;
+
+  const me = snap.yourSeatIndex !== null ? snap.seats[snap.yourSeatIndex] : null;
+  const isLobby = snap.round === "waiting" && snap.handNumber === 0;
+
+  const iAmFolded = me?.status === "folded";
+  const someoneElseFolded = snap.seats.some(
+    (s) => s.occupied && s.status === "folded" && !s.isYou
+  );
+  const canCheeky =
+    snap.mode === "full-deal" &&
+    !snap.youAreSpectator &&
+    !!iAmFolded &&
+    someoneElseFolded;
+
+  const leave = () => {
+    emit("leave_room");
+    router.push("/");
+  };
+
+  return (
+    <main className="relative mx-auto flex h-[100dvh] max-w-md flex-col overflow-hidden bg-screen">
+      <TopBar
+        snap={snap}
+        now={now}
+        canCheeky={canCheeky}
+        onCheeky={() => setShowCheeky(true)}
+        onMenu={() => setMenuOpen((v) => !v)}
+      />
+      <TurnTimerBar snap={snap} now={now} />
+
+      {isLobby ? (
+        <Lobby snap={snap} onStart={() => emit("start_hand")} />
+      ) : (
+        <TableView
+          snap={snap}
+          equity={equity}
+          result={result}
+          now={now}
+          actions={actions}
+          canPeek={!!iAmFolded && snap.mode === "full-deal" && !snap.youAreSpectator}
+          onPeek={(seatIndex) => setPeekTarget(seatIndex)}
+        />
+      )}
+
+      {!isLobby && (
+        <BottomArea snap={snap} now={now} emit={emit} />
+      )}
+
+      {result &&
+        (snap.mode === "full-deal" && result.revealedHands.length > 0 ? (
+          <ShowdownReveal
+            snap={snap}
+            result={result}
+            community={snap.communityCards}
+            onContinue={() => setResult(null)}
+            onStartHand={() => emit("start_hand")}
+          />
+        ) : (
+          <ShowdownOverlay
+            snap={snap}
+            result={result}
+            onContinue={() => setResult(null)}
+            onStartHand={() => emit("start_hand")}
+          />
+        ))}
+
+      {menuOpen && (
+        <MoreMenu
+          snap={snap}
+          onClose={() => setMenuOpen(false)}
+          onTip={() => {
+            setMenuOpen(false);
+            setShowTip(true);
+          }}
+          onHistory={() => {
+            setMenuOpen(false);
+            setShowHistory(true);
+          }}
+          onEndGame={() => {
+            setMenuOpen(false);
+            emit("end_game");
+          }}
+          onLeave={() => {
+            setMenuOpen(false);
+            leave();
+          }}
+        />
+      )}
+
+      {showCheeky && me && (
+        <CheekyBetModal
+          snap={snap}
+          onClose={() => setShowCheeky(false)}
+          emit={emit}
+        />
+      )}
+      {cheekyIncoming && (
+        <CheekyIncomingModal
+          req={cheekyIncoming}
+          onClose={() => setCheekyIncoming(null)}
+          emit={emit}
+        />
+      )}
+      {cheekySettled && (
+        <CheekySettledModal
+          settled={cheekySettled}
+          onClose={() => setCheekySettled(null)}
+        />
+      )}
+
+      {peekTarget !== null && (
+        <PeekRequestModal
+          snap={snap}
+          targetSeatIndex={peekTarget}
+          onClose={() => setPeekTarget(null)}
+          emit={emit}
+        />
+      )}
+      {peekIncoming && (
+        <PeekIncomingModal
+          req={peekIncoming}
+          onClose={() => setPeekIncoming(null)}
+          emit={emit}
+        />
+      )}
+      {peekReveal && (
+        <PeekRevealModal reveal={peekReveal} onClose={() => setPeekReveal(null)} />
+      )}
+
+      {recap && <RecapOverlay recap={recap} onClose={() => setRecap(null)} onLeave={leave} />}
+
+      {showTip && me && (
+        <TipModal snap={snap} onClose={() => setShowTip(false)} emit={emit} />
+      )}
+      {showHistory && (
+        <HistoryDrawer snap={snap} onClose={() => setShowHistory(false)} emit={emit} />
+      )}
+
+      {tip && (
+        <div className="pointer-events-none absolute inset-x-0 top-20 z-[85] flex justify-center px-6">
+          <div className="flex animate-pn-pop items-center gap-3 rounded-2xl border border-amber/40 bg-panel-2 px-4 py-3 shadow-[0_18px_44px_rgba(0,0,0,.55)]">
+            <span className="text-2xl">🎁</span>
+            <div>
+              <div className="font-display text-sm font-bold text-cream">
+                {tip.from} just sent you a tip!
+              </div>
+              <div className="font-display text-lg font-bold text-amber">+{fmt(tip.amount)} chips</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className="pointer-events-none absolute inset-x-0 top-24 z-[80] flex justify-center px-6">
+          <div className="rounded-xl border border-clay/40 bg-panel px-4 py-2.5 text-sm text-clay-soft shadow-xl">
+            {toast}
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}
+
+// ---------------- waking / loading ----------------
+function Waking() {
+  return (
+    <main className="flex min-h-screen flex-col items-center justify-center gap-4 px-8 text-center">
+      <div className="flex gap-2">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="h-3 w-3 animate-pn-blink rounded-full bg-amber"
+            style={{ animationDelay: `${i * 0.2}s` }}
+          />
+        ))}
+      </div>
+      <div className="font-display text-lg font-bold">Waking up the table…</div>
+      <p className="max-w-xs text-sm text-muted">
+        Free hosting naps after a while — the first connection can take 30–50
+        seconds. Hang tight.
+      </p>
+    </main>
+  );
+}
+
+// ---------------- top bar ----------------
+function TopBar({
+  snap,
+  now,
+  canCheeky,
+  onCheeky,
+  onMenu,
+}: {
+  snap: RoomSnapshot;
+  now: number;
+  canCheeky: boolean;
+  onCheeky: () => void;
+  onMenu: () => void;
+}) {
+  const secs = snap.turnDeadline
+    ? Math.max(0, Math.ceil((snap.turnDeadline - now) / 1000))
+    : null;
+  const timerLabel =
+    snap.turnSeconds === 0 ? "Off" : secs !== null ? `${secs}s` : `${snap.turnSeconds}s`;
+  const urgent = secs !== null && secs <= 5;
+  return (
+    <div className="z-30 flex items-center justify-between px-4 py-3">
+      <div className="flex items-center gap-2">
+        {snap.youAreSpectator ? (
+          <span className="flex items-center gap-2 rounded-full bg-live-red/[0.16] px-3 py-1.5 text-[12.5px] font-extrabold tracking-wide text-live-soft">
+            <span className="h-2 w-2 animate-pn-blink rounded-full bg-live-red" />
+            LIVE · SPECTATING
+          </span>
+        ) : (
+          <span className="rounded-lg bg-white/[0.06] px-3 py-1.5 font-display text-[13px] font-bold tracking-widest text-cream-2">
+            {snap.roomCode}
+          </span>
+        )}
+        <span className="text-[11px] text-muted-2">
+          {snap.mode === "chips-only" ? "real cards" : "online deal"}
+        </span>
+      </div>
+      <div className="flex items-center gap-2">
+        <span
+          title="Turn timer"
+          className={`flex h-9 items-center gap-1 rounded-xl border px-2.5 font-display text-[12.5px] font-bold ${
+            urgent
+              ? "animate-pn-blink border-live-red/50 bg-live-red/[0.16] text-live-soft"
+              : "border-white/10 bg-black/25 text-cream-2"
+          }`}
+        >
+          ⏱ {timerLabel}
+        </span>
+        {canCheeky && (
+          <button
+            onClick={onCheeky}
+            className="flex h-9 items-center gap-1.5 rounded-xl border border-amber/50 bg-amber/[0.13] px-3 font-display text-[12.5px] font-bold text-amber"
+          >
+            ♦ Cheeky bet
+          </button>
+        )}
+        <button
+          onClick={onMenu}
+          className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-black/25 text-lg text-cream-2"
+          title="More"
+        >
+          ⋯
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Full-width depleting bar pinned to the top of the screen, mirroring the
+// showdown "auto in Xs" progress bar. Only shown during an active timed turn.
+function TurnTimerBar({ snap, now }: { snap: RoomSnapshot; now: number }) {
+  if (!snap.turnDeadline || snap.turnSeconds === 0) return null;
+  const remaining = Math.max(0, snap.turnDeadline - now);
+  const frac = Math.min(1, remaining / (snap.turnSeconds * 1000));
+  const urgent = remaining <= 5000;
+  return (
+    <div className="absolute inset-x-0 top-0 z-40 h-1.5 bg-white/10">
+      <div
+        className={`h-full transition-[width] duration-500 ease-linear ${
+          urgent ? "bg-live-red" : "bg-amber"
+        }`}
+        style={{ width: `${frac * 100}%` }}
+      />
+    </div>
+  );
+}
+
+// Popover from the ⋯ button: Hand history, host-only End game, Leave table.
+function MoreMenu({
+  snap,
+  onClose,
+  onTip,
+  onHistory,
+  onEndGame,
+  onLeave,
+}: {
+  snap: RoomSnapshot;
+  onClose: () => void;
+  onTip: () => void;
+  onHistory: () => void;
+  onEndGame: () => void;
+  onLeave: () => void;
+}) {
+  return (
+    <>
+      <div onClick={onClose} className="absolute inset-0 z-[54] animate-pn-fade" />
+      <div className="absolute right-4 top-[68px] z-[55] w-48 animate-pn-pop rounded-2xl border border-white/12 bg-panel-2 p-1.5 shadow-[0_18px_44px_rgba(0,0,0,.55)]">
+        {snap.yourSeatIndex !== null && (
+          <button
+            onClick={onTip}
+            className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-left text-[14.5px] font-semibold text-cream"
+          >
+            🎁 Tip
+          </button>
+        )}
+        <button
+          onClick={onHistory}
+          className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-left text-[14.5px] font-semibold text-cream"
+        >
+          ⟲ Hand history
+        </button>
+        {snap.youAreHost && (
+          <button
+            onClick={onEndGame}
+            className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-left text-[14.5px] font-semibold text-amber"
+          >
+            ♠ End game · recap
+          </button>
+        )}
+        <div className="mx-2.5 my-1 h-px bg-white/[0.07]" />
+        <button
+          onClick={onLeave}
+          className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-left text-[14.5px] font-semibold text-clay-soft"
+        >
+          ⏻ Leave table
+        </button>
+      </div>
+    </>
+  );
+}
+
+// ---------------- lobby ----------------
+function Lobby({ snap, onStart }: { snap: RoomSnapshot; onStart: () => void }) {
+  const seated = snap.seats.filter((s) => s.occupied);
+  const [copied, setCopied] = useState(false);
+  const [qr, setQr] = useState("");
+  useEffect(() => {
+    const link = `${window.location.origin}/join?code=${snap.roomCode}`;
+    QRCode.toDataURL(link, { margin: 1, width: 240 })
+      .then(setQr)
+      .catch(() => setQr(""));
+  }, [snap.roomCode]);
+  return (
+    <div className="flex flex-1 flex-col overflow-hidden px-5 pb-6">
+      <div className="mt-1 flex items-center justify-between">
+        <h1 className="font-display text-2xl font-bold">Lobby</h1>
+        <span className="flex items-center gap-1.5 rounded-full bg-green/[0.12] px-3 py-1.5 text-xs font-bold text-green-soft">
+          <span className="h-1.5 w-1.5 animate-pn-blink rounded-full bg-green" /> Open
+        </span>
+      </div>
+
+      <div className="mt-3 flex items-center justify-between rounded-2xl border border-amber/20 bg-gradient-to-br from-amber/[0.16] to-amber/[0.05] p-4">
+        <div>
+          <div className="text-[11.5px] font-bold tracking-widest text-amber-soft">
+            ROOM CODE
+          </div>
+          <div className="mt-0.5 font-display text-3xl font-bold tracking-[3px]">
+            {snap.roomCode}
+          </div>
+        </div>
+        <button
+          onClick={() => {
+            navigator.clipboard?.writeText(snap.roomCode);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          }}
+          className="h-11 rounded-xl bg-amber px-4 font-display text-sm font-bold text-amber-ink"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+
+      {qr && (
+        <div className="mt-3 flex items-center gap-4 rounded-2xl border border-white/[0.07] bg-field p-4">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={qr}
+            alt="Scan to join"
+            className="h-[88px] w-[88px] flex-none rounded-lg bg-white p-1"
+          />
+          <div className="text-[13px] leading-relaxed text-muted-4">
+            <span className="font-bold text-cream">Scan to join</span>
+            <br />
+            Point a phone camera here to drop straight into the nickname screen.
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between px-1 py-3 text-[13px]">
+        <span className="font-semibold text-muted">
+          PLAYERS · {seated.length} of {snap.maxSeats}
+        </span>
+        <span className="text-muted-2">
+          {fmt(snap.buyIn)} buy-in · {snap.smallBlind}/{snap.bigBlind}
+        </span>
+      </div>
+
+      <div className="flex flex-1 flex-col gap-2.5 overflow-y-auto pb-2">
+        {seated.map((s) => (
+          <div
+            key={s.seatIndex}
+            className="flex items-center gap-3 rounded-2xl border border-white/[0.06] bg-field p-3"
+          >
+            <Avatar name={s.nickname} className="h-11 w-11 rounded-xl text-base" />
+            <div className="flex-1">
+              <div className="flex items-center gap-2">
+                <span className="font-bold">{s.nickname}</span>
+                {s.isHost && (
+                  <span className="rounded bg-amber/[0.14] px-1.5 py-0.5 text-[10px] font-extrabold tracking-wide text-amber">
+                    HOST
+                  </span>
+                )}
+              </div>
+              <div className="mt-0.5 text-[12.5px] text-muted">Seat {s.seatIndex + 1}</div>
+            </div>
+            <span className={s.connected ? "text-[12.5px] font-bold text-green" : "text-[12.5px] text-muted"}>
+              {s.connected ? "Ready" : "Away"}
+            </span>
+          </div>
+        ))}
+        {seated.length < snap.maxSeats && (
+          <div className="flex items-center gap-3 rounded-2xl border border-dashed border-white/10 p-3 text-[13.5px] text-muted-2">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/[0.04] text-xl text-muted-2">
+              +
+            </div>
+            Waiting for friends to join…
+          </div>
+        )}
+      </div>
+
+      {snap.youAreHost ? (
+        <div className="pt-3">
+          <button
+            onClick={onStart}
+            disabled={seated.length < 2}
+            className="h-14 w-full rounded-2xl bg-amber font-display text-lg font-bold text-amber-ink shadow-[0_8px_22px_rgba(224,162,59,.26)] disabled:opacity-50"
+          >
+            Start game
+          </button>
+          <p className="mt-2 text-center text-xs text-muted-2">
+            {seated.length < 2 ? "Need at least 2 players" : "Deal the first hand"}
+          </p>
+        </div>
+      ) : (
+        <p className="pt-3 text-center text-sm text-muted-2">
+          Waiting for the host to start…
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ---------------- table ----------------
+function seatXY(seatIndex: number, mySeat: number | null, count: number) {
+  // Place seats around an ellipse; the viewer (or seat 0) sits at the bottom.
+  const anchor = mySeat ?? 0;
+  const k = (seatIndex - anchor + count) % count;
+  const angle = Math.PI / 2 + (k * 2 * Math.PI) / count; // bottom = PI/2
+  return { x: 50 + 40 * Math.cos(angle), y: 48 + 42 * Math.sin(angle) };
+}
+function seatPosition(seatIndex: number, mySeat: number | null, count: number) {
+  const { x, y } = seatXY(seatIndex, mySeat, count);
+  return { left: `${x}%`, top: `${y}%` };
+}
+
+function TableView({
+  snap,
+  equity,
+  result,
+  now,
+  actions,
+  canPeek,
+  onPeek,
+}: {
+  snap: RoomSnapshot;
+  equity: Record<number, number>;
+  result: HandResultPayload | null;
+  now: number;
+  actions: Record<number, { type: string; amount: number; id: number }>;
+  canPeek: boolean;
+  onPeek: (seatIndex: number) => void;
+}) {
+  const count = snap.maxSeats;
+  return (
+    <div className="relative flex-1">
+      {/* felt */}
+      <div className="absolute inset-x-3 bottom-3 top-2 rounded-[46%] border-[11px] border-wood bg-[radial-gradient(ellipse_at_50%_40%,#2f6e51,#1c4434_72%)] shadow-[inset_0_2px_30px_rgba(0,0,0,.45),0_14px_36px_rgba(0,0,0,.5)]">
+        <div className="absolute inset-2 rounded-[44%] border border-amber/20" />
+      </div>
+
+      {/* center: pot + community / street */}
+      <div className="absolute left-1/2 top-[38%] z-[6] flex w-full -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-3">
+        <div className="flex items-center gap-2 rounded-full bg-black/40 px-4 py-1.5">
+          <span className="text-[11px] font-bold tracking-widest text-amber-soft">POT</span>
+          <span className="font-display text-lg font-bold">{fmt(snap.pot)}</span>
+        </div>
+
+        {snap.mode === "full-deal" ? (
+          <div className="flex gap-1.5">
+            {[0, 1, 2, 3, 4].map((i) =>
+              snap.communityCards[i] ? (
+                <PlayingCard key={i} card={snap.communityCards[i]} />
+              ) : (
+                <CardBack key={i} />
+              )
+            )}
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-2">
+            <div className="flex gap-1.5">
+              {(["flop", "turn", "river"] as const).map((st) => {
+                const reached =
+                  ["flop", "turn", "river", "showdown"].indexOf(snap.round) >=
+                  ["flop", "turn", "river"].indexOf(st);
+                return (
+                  <span
+                    key={st}
+                    className={`rounded-lg px-3 py-1.5 font-display text-xs font-bold ${
+                      reached
+                        ? "border border-amber/30 bg-amber/[0.16] text-amber"
+                        : "bg-white/5 text-muted-2"
+                    }`}
+                  >
+                    {st.toUpperCase()}
+                  </span>
+                );
+              })}
+            </div>
+            <div className="text-[11.5px] text-white/35">
+              ♠ cards are physical — tracking chips only
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* seats */}
+      {snap.seats.map((s) => {
+        if (!s.occupied) return null;
+        const xy = seatXY(s.seatIndex, snap.yourSeatIndex, count);
+        const dx = 50 - xy.x;
+        const dy = 48 - xy.y;
+        const len = Math.hypot(dx, dy) || 1;
+        return (
+          <SeatView
+            key={s.seatIndex}
+            seat={s}
+            pos={{ left: `${xy.x}%`, top: `${xy.y}%` }}
+            inward={{ x: dx / len, y: dy / len }}
+            isDealer={s.isDealer}
+            isActor={s.isActor && snap.round !== "waiting"}
+            deadline={snap.turnDeadline}
+            now={now}
+            equity={snap.youAreSpectator ? equity[s.seatIndex] : undefined}
+            won={result?.winners.includes(s.seatIndex) ?? false}
+            action={actions[s.seatIndex]}
+            bigBlind={snap.bigBlind}
+            peekable={canPeek && s.status === "folded" && !s.isYou}
+            onPeek={() => onPeek(s.seatIndex)}
+          />
+        );
+      })}
+
+      <NextActorArrow snap={snap} />
+    </div>
+  );
+}
+
+// A bouncing arrow pointing from the current actor toward the next player to act,
+// showing the direction of play. ponytail: angle is computed in %-space so it's
+// a touch off on the non-square table — fine as a cue, not a compass.
+function NextActorArrow({ snap }: { snap: RoomSnapshot }) {
+  const actor = snap.currentActorIndex;
+  if (actor < 0 || snap.round === "waiting") return null;
+  const count = snap.maxSeats;
+  let next = -1;
+  for (let i = 1; i < count; i++) {
+    const j = (actor + i) % count;
+    const s = snap.seats[j];
+    if (s?.occupied && s.status === "active") {
+      next = j;
+      break;
+    }
+  }
+  if (next < 0) return null;
+  const a = seatXY(actor, snap.yourSeatIndex, count);
+  const b = seatXY(next, snap.yourSeatIndex, count);
+  const ang = (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI;
+  return (
+    <div
+      className="pointer-events-none absolute z-[7] animate-pn-blink font-display text-2xl text-amber drop-shadow-[0_2px_4px_rgba(0,0,0,.6)]"
+      style={{
+        left: `${a.x + (b.x - a.x) * 0.5}%`,
+        top: `${a.y + (b.y - a.y) * 0.5}%`,
+        transform: `translate(-50%, -50%) rotate(${ang}deg)`,
+      }}
+    >
+      ➜
+    </div>
+  );
+}
+
+function SeatView({
+  seat,
+  pos,
+  inward,
+  isDealer,
+  isActor,
+  deadline,
+  now,
+  equity,
+  won,
+  action,
+  bigBlind,
+  peekable,
+  onPeek,
+}: {
+  seat: PublicSeat;
+  pos: { left: string; top: string };
+  inward: { x: number; y: number };
+  isDealer: boolean;
+  isActor: boolean;
+  deadline: number | null;
+  now: number;
+  equity?: number;
+  won: boolean;
+  action?: { type: string; amount: number; id: number };
+  bigBlind: number;
+  peekable: boolean;
+  onPeek: () => void;
+}) {
+  const folded = seat.status === "folded";
+  const secs =
+    isActor && deadline ? Math.max(0, Math.ceil((deadline - now) / 1000)) : null;
+
+  return (
+    <div
+      className="absolute z-[8] w-24 -translate-x-1/2 -translate-y-1/2 text-center"
+      style={{ left: pos.left, top: pos.top, opacity: folded ? 0.45 : 1 }}
+      onClick={peekable ? onPeek : undefined}
+      role={peekable ? "button" : undefined}
+    >
+      {/* hole cards: face-up if revealed to us, backs for opponents mid-hand */}
+      <div
+        className={`relative z-[1] -mb-3 flex h-9 items-end justify-center gap-1 ${
+          seat.isYou && seat.holeCards
+            ? "cursor-zoom-in transition-transform duration-150 hover:z-30 hover:-translate-y-3 hover:scale-[1.6]"
+            : ""
+        }`}
+      >
+        {!folded && seat.holeCards
+          ? seat.holeCards.map((c, i) => (
+              <PlayingCard key={i} card={c} className="h-9 w-[26px] text-xs" />
+            ))
+          : !folded && (seat.status === "active" || seat.status === "all-in") && (
+              <>
+                <CardBack className="h-9 w-[26px] -rotate-6" />
+                <CardBack className="h-9 w-[26px] rotate-6" />
+              </>
+            )}
+      </div>
+
+      {/* avatar */}
+      <div className="relative mx-auto h-[52px] w-[52px]" style={{ width: 52, height: 52 }}>
+        {action && (
+          <ActionBubble key={action.id} action={action} bigBlind={bigBlind} />
+        )}
+        {isActor && (
+          <div
+            className="absolute -inset-1 rounded-full border-[3px] border-amber"
+            style={{ animation: "pn-pulse 1.6s infinite" }}
+          />
+        )}
+        <Avatar
+          name={seat.nickname}
+          className={`h-[52px] w-[52px] rounded-full text-[17px] ${
+            won ? "ring-[3px] ring-green" : isActor ? "" : ""
+          }`}
+          style={{ width: 52, height: 52, opacity: seat.connected ? 1 : 0.5 }}
+        />
+        {secs !== null && (
+          <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-amber px-1 font-display text-[11px] font-bold text-amber-ink">
+            {secs}
+          </span>
+        )}
+        {equity !== undefined && !folded && (
+          <span className="absolute -right-4 -top-2 rounded-lg border border-black/20 bg-black/65 px-1.5 py-0.5 font-display text-[11px] font-bold text-cream shadow">
+            {equity}%
+          </span>
+        )}
+        {isDealer && (
+          <span className="absolute -bottom-1 -left-1 flex h-5 w-5 items-center justify-center rounded-full bg-cream font-display text-[10px] font-bold text-card-ink">
+            D
+          </span>
+        )}
+        {folded && (
+          <span className="absolute -bottom-1 left-1/2 -translate-x-1/2 rounded bg-[#3a2420] px-1.5 py-0.5 text-[9px] font-extrabold tracking-wide text-[#c98b7d]">
+            FOLD
+          </span>
+        )}
+        {peekable && (
+          <span className="absolute -right-1 -top-1 flex h-5 w-5 items-center justify-center rounded-full border border-amber/50 bg-panel-2 text-[10px] text-amber">
+            ◉
+          </span>
+        )}
+      </div>
+
+      {/* name + stack */}
+      <div
+        className={`mt-2 inline-flex flex-col items-center rounded-lg border bg-black/40 px-2.5 py-1 ${
+          won ? "border-green/60" : "border-white/[0.07]"
+        }`}
+      >
+        <span className="text-xs font-bold leading-tight">{seat.nickname}</span>
+        <span className="font-display text-xs font-bold leading-tight text-amber">
+          {fmt(seat.chips)}
+        </span>
+      </div>
+
+      {/* current bet — placed on the felt in front of the player, toward the pot */}
+      {seat.currentBet > 0 && (
+        <div
+          className="absolute left-1/2 top-1/2 z-[9] inline-flex items-center gap-1.5 rounded-full bg-black/55 px-2 py-0.5"
+          style={{
+            transform: `translate(-50%, -50%) translate(${inward.x * 80}px, ${inward.y * 80}px)`,
+          }}
+        >
+          <span className="h-3 w-3 rounded-full border-2 border-dashed border-amber-deep bg-amber" />
+          <span className="font-display text-[11.5px] font-bold text-amber-soft">
+            {fmt(seat.currentBet)}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Avatar({
+  name,
+  className = "",
+  style,
+}: {
+  name: string;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  return (
+    <div
+      className={`flex items-center justify-center font-display font-bold text-white shadow-[0_4px_10px_rgba(0,0,0,.4)] ${className}`}
+      style={{ background: colorFor(name), ...style }}
+    >
+      {initials(name)}
+    </div>
+  );
+}
+
+// Per-action chat bubble that pops above a player's avatar for 2s. Each action
+// gets its own little animation (smoke / point / rising arrows / slam).
+function ActionBubble({
+  action,
+  bigBlind,
+}: {
+  action: { type: string; amount: number };
+  bigBlind: number;
+}) {
+  const { type, amount } = action;
+  const shell =
+    "pointer-events-none absolute -top-9 left-1/2 z-30 -translate-x-1/2 whitespace-nowrap";
+  const pill =
+    "relative animate-pn-bubble rounded-xl px-2 py-1 font-display text-[11px] font-extrabold shadow-[0_4px_10px_rgba(0,0,0,.4)]";
+
+  if (type === "fold") {
+    // smoke puffs ring the bubble (not inside it)
+    const puffs = [
+      "left-1/2 -top-2 -translate-x-1/2",
+      "-left-2 top-1/2 -translate-y-1/2",
+      "-right-2 top-1/2 -translate-y-1/2",
+      "left-1 -bottom-2",
+      "right-1 -bottom-2",
+    ];
+    return (
+      <div className={shell}>
+        {puffs.map((p, i) => (
+          <span
+            key={i}
+            className={`absolute h-3.5 w-3.5 rounded-full bg-white/40 blur-[2px] ${p}`}
+            style={{ animation: "pn-smoke 1s ease-out forwards", animationDelay: `${i * 0.07}s` }}
+          />
+        ))}
+        <div className={`${pill} bg-[#3a3a3a] text-white/70`}>Fold</div>
+      </div>
+    );
+  }
+
+  if (type === "call" || type === "check") {
+    return (
+      <div className={shell}>
+        <div className={`${pill} bg-[#2f6e51] text-cream`}>
+          <span className="mr-1 inline-block animate-pn-point">👉</span>
+          {type === "call" ? "Call!" : "Check"}
+        </div>
+      </div>
+    );
+  }
+
+  if (type === "all-in") {
+    return (
+      <div className={shell} style={{ animation: "pn-shake .4s ease 2" }}>
+        <div className={`${pill} animate-pn-slam bg-live-red px-2.5 text-[13px] text-white`}>
+          ALL IN
+        </div>
+      </div>
+    );
+  }
+
+  // bet / raise — arrows + money signs float AROUND the pill (not inside, so the
+  // bubble keeps a fixed size); more arrows for a bigger raise.
+  const arrows = Math.min(5, Math.max(1, Math.round(amount / Math.max(1, bigBlind * 2))));
+  const spots = [
+    "left-1/2 -top-3.5 -translate-x-1/2",
+    "-left-4 top-0",
+    "-right-4 top-0",
+    "left-0 -top-3",
+    "right-0 -top-3",
+  ];
+  return (
+    <div className={shell}>
+      {Array.from({ length: arrows }).map((_, i) => (
+        <span
+          key={i}
+          className={`absolute text-[11px] animate-pn-rise ${spots[i % spots.length]}`}
+          style={{ animationDelay: `${i * 0.1}s` }}
+        >
+          💲
+        </span>
+      ))}
+      <div className={`${pill} bg-amber text-amber-ink`}>
+        {type === "bet" ? "Bet" : "Raise"}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- bottom area (action / host / spectator / status) ----------------
+function BottomArea({
+  snap,
+  now,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  now: number;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const me = snap.yourSeatIndex !== null ? snap.seats[snap.yourSeatIndex] : null;
+  const myTurn = me !== null && snap.currentActorIndex === snap.yourSeatIndex && snap.round !== "waiting";
+  const bettingSettled = snap.currentActorIndex < 0 && snap.round !== "waiting";
+
+  if (snap.youAreSpectator) return <SpectatorStrip snap={snap} />;
+
+  if (myTurn && me) return <ActionBar snap={snap} me={me} emit={emit} />;
+
+  if (snap.mode === "chips-only" && snap.youAreHost && snap.round === "showdown")
+    return <AwardPicker snap={snap} emit={emit} />;
+
+  if (snap.mode === "chips-only" && snap.youAreHost && bettingSettled)
+    return <DealStrip snap={snap} emit={emit} />;
+
+  // between hands / waiting for others
+  return (
+    <div className="z-20 border-t border-white/[0.06] bg-bar px-5 pb-7 pt-4">
+      <div className="flex items-center justify-between">
+        <span className="text-[13px] text-muted">
+          {snap.round === "waiting"
+            ? "Between hands"
+            : snap.currentActorIndex >= 0
+            ? `Waiting for ${snap.seats[snap.currentActorIndex]?.nickname ?? "…"}…`
+            : "Waiting…"}
+        </span>
+        <div className="flex gap-2">
+          {snap.youAreHost && snap.round === "waiting" && (
+            <button
+              onClick={() => emit("start_hand")}
+              className="rounded-xl bg-amber px-4 py-2 font-display text-[14px] font-bold text-amber-ink"
+            >
+              Deal next hand
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ActionBar({
+  snap,
+  me,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  me: PublicSeat;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const highest = Math.max(0, ...snap.seats.map((s) => s.currentBet));
+  const toCall = Math.max(0, highest - me.currentBet);
+  const maxTotal = me.currentBet + me.chips; // all-in total this street
+  const isBet = highest === 0;
+  const minTotal = isBet
+    ? Math.min(maxTotal, snap.bigBlind)
+    : Math.min(maxTotal, highest + snap.minRaise);
+  const [amount, setAmount] = useState(minTotal);
+
+  // keep slider valid as state changes
+  const amt = Math.min(Math.max(amount, minTotal), maxTotal);
+  const canRaise = maxTotal > highest; // have chips to raise/bet at all
+
+  // Free-typing bet box: holds raw text while editing so it can be cleared
+  // fully; only commits on Enter/blur, snapping to the min bet if out of range.
+  const [betText, setBetText] = useState<string | null>(null);
+  const commitBet = () => {
+    const n = parseInt(betText ?? "", 10);
+    setAmount(Number.isFinite(n) && n >= minTotal && n <= maxTotal ? n : minTotal);
+    setBetText(null);
+  };
+
+  const send = (type: string, a?: number) => emit("player_action", { type, amount: a });
+  const quick = (target: number) => setAmount(Math.min(maxTotal, Math.max(minTotal, target)));
+
+  return (
+    <div className="z-20 border-t border-white/[0.06] bg-gradient-to-t from-bar from-70% to-transparent px-4 pb-7 pt-3.5">
+      <div className="mb-2.5 flex items-center justify-between text-[13px]">
+        <span className="font-semibold text-muted">
+          Your turn ·{" "}
+          <span className="text-amber">
+            {toCall > 0 ? `to call ${fmt(toCall)}` : "check or bet"}
+          </span>
+        </span>
+        {canRaise && (
+          <span className="font-display text-[15px] font-bold">
+            {isBet ? `Bet ${fmt(amt)}` : `Raise to ${fmt(amt)}`}
+          </span>
+        )}
+      </div>
+
+      {canRaise && (
+        <div className="mb-3 flex items-center gap-2.5">
+          <input
+            type="number"
+            inputMode="numeric"
+            min={minTotal}
+            max={maxTotal}
+            value={betText ?? amt}
+            onFocus={() => setBetText(String(amt))}
+            onChange={(e) => setBetText(e.target.value)}
+            onBlur={commitBet}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            }}
+            className="h-9 w-[64px] flex-none rounded-lg border border-white/12 bg-field px-2 text-center font-display text-[13px] font-bold text-amber outline-none focus:border-amber/50"
+          />
+          <input
+            type="range"
+            min={minTotal}
+            max={maxTotal}
+            value={amt}
+            onChange={(e) => setAmount(+e.target.value)}
+            className="h-2 flex-1 accent-amber"
+          />
+          <div className="flex gap-1.5">
+            <button
+              onClick={() => quick(me.currentBet + Math.round(snap.pot / 2))}
+              className="rounded-lg border border-white/12 bg-white/[0.04] px-2.5 py-1.5 font-display text-[11.5px] font-bold text-cream-2"
+            >
+              ½ Pot
+            </button>
+            <button
+              onClick={() => quick(me.currentBet + snap.pot)}
+              className="rounded-lg border border-white/12 bg-white/[0.04] px-2.5 py-1.5 font-display text-[11.5px] font-bold text-cream-2"
+            >
+              Pot
+            </button>
+            <button
+              onClick={() => quick(maxTotal)}
+              className="rounded-lg border border-amber/40 bg-amber/[0.12] px-2.5 py-1.5 font-display text-[11.5px] font-bold text-amber"
+            >
+              All-in
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex gap-2.5">
+        <button
+          onClick={() => send("fold")}
+          className="h-14 flex-1 rounded-2xl border border-clay/40 bg-clay/10 font-display text-base font-bold text-clay-soft"
+        >
+          Fold
+        </button>
+        <button
+          onClick={() => send(toCall > 0 ? "call" : "check")}
+          className="h-14 flex-[1.2] rounded-2xl border border-white/14 bg-white/[0.06] font-display text-base font-bold text-cream"
+        >
+          {toCall > 0 ? `Call ${fmt(Math.min(toCall, me.chips))}` : "Check"}
+        </button>
+        {canRaise && (
+          <button
+            onClick={() =>
+              amt >= maxTotal ? send("all-in") : send(isBet ? "bet" : "raise", amt)
+            }
+            className="h-14 flex-[1.4] rounded-2xl bg-amber font-display text-base font-bold text-amber-ink shadow-[0_8px_20px_rgba(224,162,59,.3)]"
+          >
+            {amt >= maxTotal ? "All-in" : isBet ? `Bet ${fmt(amt)}` : `Raise ${fmt(amt)}`}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DealStrip({
+  snap,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const nextLabel: Record<string, string> = {
+    preflop: "Deal flop",
+    flop: "Deal turn",
+    turn: "Deal river",
+    river: "Go to showdown",
+  };
+  return (
+    <div className="z-20 border-t border-white/[0.06] bg-gradient-to-t from-bar from-70% to-transparent px-4 pb-7 pt-3.5">
+      <div className="mb-2.5 flex items-center gap-2">
+        <span className="rounded bg-amber/[0.14] px-2 py-0.5 text-[10px] font-extrabold tracking-wide text-amber">
+          HOST
+        </span>
+        <span className="text-[12.5px] font-semibold text-muted">
+          Advance the round as you deal the real deck
+        </span>
+      </div>
+      <button
+        onClick={() => emit("advance_street")}
+        className="h-[52px] w-full rounded-2xl bg-amber py-3.5 font-display text-base font-bold text-amber-ink shadow-[0_8px_20px_rgba(224,162,59,.28)]"
+      >
+        {nextLabel[snap.round] ?? "Advance"}
+      </button>
+    </div>
+  );
+}
+
+function AwardPicker({
+  snap,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const [sel, setSel] = useState<number[]>([]);
+  // Optional cosmetic tag — picks the win animation, since the server never saw
+  // the real cards (build prompt §14). Values map via getAnimationTier().
+  const [category, setCategory] = useState<string | null>(null);
+  const candidates = snap.seats.filter((s) => s.occupied && s.status !== "folded");
+  const toggle = (i: number) =>
+    setSel((cur) => (cur.includes(i) ? cur.filter((x) => x !== i) : [...cur, i]));
+  const TAGS: [string, string][] = [
+    ["High Card", "😂 Bluff"],
+    ["Pair", "Pair"],
+    ["Two Pair", "Two pair"],
+    ["Full House", "🔥 Monster"],
+  ];
+  return (
+    <div className="z-20 border-t border-white/[0.06] bg-bar px-4 pb-7 pt-3.5">
+      <div className="mb-2.5 rounded-2xl border border-amber/30 bg-amber/10 px-4 py-3">
+        <div className="font-bold text-amber">Pick the winner(s) of the {fmt(snap.pot)} pot</div>
+        <div className="mt-0.5 text-[12.5px] text-muted-4">
+          Tap players who showed the best hand. Ties split the pot.
+        </div>
+      </div>
+      <div className="mb-3 flex flex-wrap gap-2">
+        {candidates.map((s) => (
+          <button
+            key={s.seatIndex}
+            onClick={() => toggle(s.seatIndex)}
+            className={`flex items-center gap-2 rounded-xl border px-3 py-2 ${
+              sel.includes(s.seatIndex)
+                ? "border-amber bg-amber/20 text-cream"
+                : "border-white/12 bg-white/[0.04] text-cream-2"
+            }`}
+          >
+            <Avatar name={s.nickname} className="h-7 w-7 rounded-lg text-[11px]" />
+            <span className="text-[13px] font-bold">{s.nickname}</span>
+            {sel.includes(s.seatIndex) && <span className="text-amber">✓</span>}
+          </button>
+        ))}
+      </div>
+      <div className="mb-3 flex flex-wrap items-center gap-1.5">
+        <span className="mr-1 text-[11px] font-bold tracking-wide text-muted-2">
+          ANIMATION
+        </span>
+        {TAGS.map(([val, label]) => (
+          <button
+            key={val}
+            onClick={() => setCategory((c) => (c === val ? null : val))}
+            className={`rounded-lg border px-2.5 py-1 font-display text-[11.5px] font-bold ${
+              category === val
+                ? "border-amber bg-amber/[0.16] text-amber"
+                : "border-white/12 bg-white/[0.04] text-cream-2"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <button
+        onClick={() =>
+          sel.length &&
+          emit("award_pot", {
+            winningSeatIndexes: sel,
+            handCategory: category ?? undefined,
+          })
+        }
+        disabled={!sel.length}
+        className="h-[52px] w-full rounded-2xl bg-amber py-3.5 font-display text-base font-bold text-amber-ink disabled:opacity-40"
+      >
+        Award {fmt(snap.pot)}
+      </button>
+    </div>
+  );
+}
+
+function SpectatorStrip({ snap }: { snap: RoomSnapshot }) {
+  return (
+    <div className="z-20 bg-gradient-to-t from-bar from-[72%] to-transparent px-4 pb-7 pt-4">
+      <div className="rounded-2xl border border-white/[0.08] bg-black/30 px-4 py-3.5 text-center">
+        <div className="text-[11.5px] font-bold tracking-wide text-muted">SPECTATING</div>
+        <div className="mt-1 text-sm text-cream-2">
+          {snap.mode === "full-deal"
+            ? "You can see every hand face-up. Equity updates live as the board runs out."
+            : "Cards are physical — you see the same chip view as everyone else."}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- overlays ----------------
+
+// Cinematic full-deal showdown (single screen): every player still in the hand
+// has their cards shake, then flip face-up; then the winner is announced, their
+// best five lock together, and the tier WinAnimation plays — all in place.
+// Players dismiss with Continue; the host can force everyone into the next hand.
+function ShowdownReveal({
+  snap,
+  result,
+  community,
+  onContinue,
+  onStartHand,
+}: {
+  snap: RoomSnapshot;
+  result: HandResultPayload;
+  community: RoomSnapshot["communityCards"];
+  onContinue: () => void;
+  onStartHand: () => void;
+}) {
+  // hole cards revealed so far (0 → 1 → 2), then the winner "form" screen
+  const [revealed, setRevealed] = useState(0);
+  const [phase, setPhase] = useState<"reveal" | "form">("reveal");
+  const [animDone, setAnimDone] = useState(false);
+  const tier = getAnimationTier(result.handCategory);
+  const winner =
+    result.revealedHands.find((h) => result.winners.includes(h.seatIndex)) ??
+    result.revealedHands[0];
+
+  useEffect(() => {
+    const t1 = setTimeout(() => setRevealed(1), 2000); // 2s, then first card
+    const t2 = setTimeout(() => setRevealed(2), 3000); // 1s, then second card
+    const t3 = setTimeout(() => setPhase("form"), 5000); // 2s pause, then winner
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, []);
+
+  return (
+    <div className="absolute inset-0 z-[45] flex flex-col items-center justify-center gap-6 bg-[rgba(6,10,7,.82)] px-5 backdrop-blur-sm">
+      {phase !== "form" ? (
+        <>
+          <div className="font-display text-sm font-bold tracking-widest text-amber-soft">
+            SHOWDOWN
+          </div>
+          {/* the board, so players can see the full five the whole time */}
+          <div className="flex items-end gap-1.5">
+            {community.map((c, i) => (
+              <PlayingCard key={`b${i}`} card={c} className="h-[52px] w-[37px] text-base" />
+            ))}
+          </div>
+          <div className="flex flex-wrap items-start justify-center gap-x-6 gap-y-5">
+            {result.revealedHands.map((h) => (
+              <div key={h.seatIndex} className="flex flex-col items-center gap-2">
+                <div className="flex gap-1.5">
+                  {h.holeCards.map((c, i) =>
+                    i < revealed ? (
+                      <PlayingCard key={i} card={c} />
+                    ) : (
+                      <span key={i} className="animate-pn-jitter">
+                        <CardBack className="h-[58px] w-[42px]" />
+                      </span>
+                    )
+                  )}
+                </div>
+                <span className="text-xs font-bold text-cream-2">{h.nickname}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+        <div className="relative flex animate-pn-up flex-col items-center gap-4">
+          {/* confetti raining around the winner, like the raise money signs */}
+          {Array.from({ length: 12 }).map((_, i) => (
+            <span
+              key={i}
+              className="pointer-events-none absolute animate-pn-rise text-lg"
+              style={{
+                left: `${8 + (i * 84) / 12}%`,
+                top: `${i % 2 ? "-8%" : "12%"}`,
+                animationDelay: `${(i % 6) * 0.12}s`,
+              }}
+            >
+              🎉
+            </span>
+          ))}
+          <div className="font-display text-base font-extrabold tracking-wide text-amber">
+            {winner?.nickname} wins · {winner?.handName}
+          </div>
+          {/* the best 5 cards; the winner's own two are ringed amber */}
+          <div className="flex items-end gap-1.5">
+            {(winner?.bestCards ?? []).map((c, i) => {
+              const isHole = winner?.holeCards.some(
+                (h) => h.rank === c.rank && h.suit === c.suit
+              );
+              return (
+                <span
+                  key={i}
+                  className={`inline-block animate-pn-up rounded-md ${
+                    isHole ? "ring-2 ring-amber" : ""
+                  }`}
+                  style={{ animationDelay: `${i * 0.12}s` }}
+                >
+                  <PlayingCard card={c} className="h-[58px] w-[42px] text-base" />
+                </span>
+              );
+            })}
+          </div>
+          <div className="text-[13px] font-semibold text-cream-2">{winner?.handDescr}</div>
+
+          {/* the losers, crying */}
+          {result.revealedHands.filter((h) => !result.winners.includes(h.seatIndex)).length > 0 && (
+            <div className="flex flex-wrap items-start justify-center gap-x-5 gap-y-3">
+              {result.revealedHands
+                .filter((h) => !result.winners.includes(h.seatIndex))
+                .map((h) => (
+                  <div key={h.seatIndex} className="relative flex flex-col items-center gap-1">
+                    <div className="relative text-2xl">
+                      😢
+                      {/* tears falling from the face */}
+                      {[0, 1].map((d) => (
+                        <span
+                          key={d}
+                          className="pointer-events-none absolute top-[60%] animate-pn-drip text-[11px]"
+                          style={{
+                            left: d ? "62%" : "30%",
+                            animationDelay: `${d * 0.5}s`,
+                          }}
+                        >
+                          💧
+                        </span>
+                      ))}
+                    </div>
+                    <div className="flex gap-1">
+                      {h.holeCards.map((c, i) => (
+                        <PlayingCard key={i} card={c} className="h-10 w-[28px] text-xs" faded />
+                      ))}
+                    </div>
+                    <span className="text-[11px] font-bold text-cream-2">{h.nickname}</span>
+                    <span className="text-[10px] text-muted">{h.handDescr}</span>
+                  </div>
+                ))}
+            </div>
+          )}
+
+          <div className="mt-1 flex gap-2.5">
+            <button
+              onClick={onContinue}
+              className="h-12 rounded-2xl bg-white/[0.08] px-7 font-display text-base font-bold text-cream"
+            >
+              Continue
+            </button>
+            {snap.youAreHost && (
+              <button
+                onClick={onStartHand}
+                className="h-12 rounded-2xl bg-amber px-7 font-display text-base font-bold text-amber-ink shadow-[0_8px_20px_rgba(224,162,59,.3)]"
+              >
+                Start next hand
+              </button>
+            )}
+          </div>
+        </div>
+        {/* tier moment from the old showdown panel, layered over the full screen */}
+        {tier !== "neutral" && !animDone && (
+          <WinAnimation
+            tier={tier}
+            cards={winner?.holeCards}
+            onComplete={() => setAnimDone(true)}
+          />
+        )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ShowdownOverlay({
+  snap,
+  result,
+  onContinue,
+  onStartHand,
+}: {
+  snap: RoomSnapshot;
+  result: HandResultPayload;
+  onContinue: () => void;
+  onStartHand: () => void;
+}) {
+  const winnerNames = result.winners
+    .map((i) => snap.seats[i]?.nickname)
+    .filter(Boolean)
+    .join(", ");
+  const [animDone, setAnimDone] = useState(false);
+  const tier = getAnimationTier(result.handCategory);
+  // Cards to spin for the small/medium tiers — the winning seat's hole cards.
+  const winnerCards =
+    result.revealedHands.find((h) => result.winners.includes(h.seatIndex))
+      ?.holeCards ?? [];
+  return (
+    <>
+      <div className="absolute inset-0 z-40 animate-pn-fade bg-[rgba(8,12,9,.55)] backdrop-blur-sm" />
+      {!animDone && tier !== "neutral" && (
+        <WinAnimation
+          tier={tier}
+          cards={winnerCards}
+          onComplete={() => setAnimDone(true)}
+        />
+      )}
+      <div className="absolute inset-x-0 bottom-0 z-[41] animate-pn-up rounded-t-3xl border-t border-amber/25 bg-panel px-5 pb-7 pt-5 shadow-[0_-20px_50px_rgba(0,0,0,.5)]">
+        <div className="mx-auto mb-4 h-1 w-10 rounded-full bg-white/20" />
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="font-display text-xl font-bold">Showdown</h2>
+          <span className="text-[13px] text-muted">Pot {fmt(snap.pot || 0)}</span>
+        </div>
+
+        <div className="mb-4 flex max-h-[40dvh] flex-col gap-2.5 overflow-y-auto">
+          {result.revealedHands.length === 0 && (
+            <div className="rounded-2xl border border-white/[0.07] bg-white/[0.03] p-4 text-center text-sm text-muted">
+              {winnerNames ? `${winnerNames} won the pot.` : "Pot awarded."}
+            </div>
+          )}
+          {result.revealedHands.map((h) => {
+            const won = result.winners.includes(h.seatIndex);
+            return (
+              <div
+                key={h.seatIndex}
+                className={`flex items-center gap-3 rounded-2xl p-3.5 ${
+                  won
+                    ? "border-[1.5px] border-amber/50 bg-gradient-to-br from-amber/[0.18] to-amber/[0.05]"
+                    : "border border-white/[0.07] bg-white/[0.03]"
+                }`}
+              >
+                <Avatar name={h.nickname} className="h-11 w-11 rounded-xl text-base" />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-extrabold">{h.nickname}</span>
+                    {won && (
+                      <span className="rounded bg-amber px-1.5 py-0.5 text-[9.5px] font-extrabold tracking-wide text-amber-ink">
+                        WINNER
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-0.5 text-[13px] font-semibold text-amber-soft">
+                    {h.handDescr}
+                  </div>
+                </div>
+                <div className="flex gap-1">
+                  {h.holeCards.map((c, i) => (
+                    <PlayingCard key={i} card={c} className="h-11 w-[30px] text-sm" faded={!won} />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="flex gap-2.5">
+          <button
+            onClick={onContinue}
+            className="h-14 flex-1 rounded-2xl bg-white/[0.08] font-display text-base font-bold text-cream"
+          >
+            Continue
+          </button>
+          {snap.youAreHost && (
+            <button
+              onClick={onStartHand}
+              className="h-14 flex-1 rounded-2xl bg-amber font-display text-base font-bold text-amber-ink"
+            >
+              Start next hand
+            </button>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function TipModal({
+  snap,
+  onClose,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  onClose: () => void;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const others = snap.seats.filter((s) => s.occupied && !s.isYou);
+  const [target, setTarget] = useState<number | null>(others[0]?.seatIndex ?? null);
+  const [amount, setAmount] = useState(50);
+  const me = snap.yourSeatIndex !== null ? snap.seats[snap.yourSeatIndex] : null;
+
+  const send = () => {
+    if (!me || target === null || amount <= 0 || amount > me.chips) return;
+    emit("donate_chips", { toSeatIndex: target, amount });
+    onClose();
+  };
+
+  return (
+    <>
+      <div onClick={onClose} className="absolute inset-0 z-50 animate-pn-fade bg-[rgba(8,12,9,.62)] backdrop-blur-sm" />
+      <div className="absolute inset-x-4 top-1/2 z-[51] -translate-y-1/2 animate-pn-pop rounded-3xl border border-white/10 bg-panel-2 p-5 shadow-[0_30px_70px_rgba(0,0,0,.6)]">
+        <div className="mb-1 flex items-center justify-between">
+          <h2 className="font-display text-xl font-bold">Tip</h2>
+          <button onClick={onClose} className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/[0.06] text-cream-2">
+            ✕
+          </button>
+        </div>
+        <p className="mb-4 text-[13px] text-muted">
+          Gift chips to another player.
+        </p>
+        <div className="mb-4 flex gap-2.5 overflow-x-auto px-1 py-1.5">
+          {others.map((s) => (
+            <button
+              key={s.seatIndex}
+              onClick={() => setTarget(s.seatIndex)}
+              className="flex flex-none flex-col items-center gap-1.5"
+            >
+              <Avatar
+                name={s.nickname}
+                className={`h-[52px] w-[52px] rounded-full text-base ${
+                  target === s.seatIndex
+                    ? "ring-2 ring-amber ring-offset-2 ring-offset-panel-2"
+                    : "opacity-70"
+                }`}
+              />
+              <span className="text-[11px] text-muted">{s.nickname}</span>
+            </button>
+          ))}
+        </div>
+        <div className="mb-3.5 flex gap-2.5">
+          {[25, 50, 100].map((v) => (
+            <button
+              key={v}
+              onClick={() => setAmount(v)}
+              className={`h-11 flex-1 rounded-xl font-display text-[15px] font-bold ${
+                amount === v
+                  ? "border-[1.5px] border-amber bg-amber/[0.14] text-amber"
+                  : "border border-white/12 bg-white/[0.04] text-cream-2"
+              }`}
+            >
+              {v}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={send}
+          disabled={target === null}
+          className="h-14 w-full rounded-2xl bg-amber font-display text-base font-bold text-amber-ink disabled:opacity-40"
+        >
+          Send {amount}
+          {target !== null ? ` to ${snap.seats[target]?.nickname}` : ""}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function HistoryDrawer({
+  snap,
+  onClose,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  onClose: () => void;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const hands = [...(snap.handHistory ?? [])].reverse();
+  const [confirm, setConfirm] = useState<number | null>(null);
+  return (
+    <>
+      <div onClick={onClose} className="absolute inset-0 z-50 animate-pn-fade bg-[rgba(8,12,9,.6)] backdrop-blur-sm" />
+      <div className="absolute inset-x-0 bottom-0 z-[51] flex h-[78%] animate-pn-up flex-col rounded-t-3xl border-t border-white/10 bg-panel shadow-[0_-20px_50px_rgba(0,0,0,.6)]">
+        <div className="px-5 pb-1.5 pt-4">
+          <div className="mx-auto mb-3.5 h-1 w-10 rounded-full bg-white/20" />
+          <div className="flex items-center justify-between">
+            <h2 className="font-display text-xl font-bold">Hand history</h2>
+            <button onClick={onClose} className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/[0.06] text-cream-2">
+              ✕
+            </button>
+          </div>
+          {snap.youAreHost && (
+            <button
+              onClick={() => emit("undo_last_action")}
+              disabled={!snap.canUndo}
+              className="mt-3.5 flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-white/14 bg-white/[0.05] font-display text-sm font-bold text-cream-2 disabled:opacity-40"
+            >
+              ↩ Undo last action
+            </button>
+          )}
+        </div>
+        <div className="flex flex-1 flex-col gap-2.5 overflow-y-auto px-5 pb-6 pt-3.5">
+          {hands.length === 0 && (
+            <p className="py-8 text-center text-sm text-muted">No hands played yet.</p>
+          )}
+          {hands.map((h) => {
+            const later = snap.handNumber - h.handNumber;
+            return (
+              <div
+                key={h.handNumber}
+                className={`rounded-2xl border bg-field p-3.5 ${
+                  confirm === h.handNumber ? "border-clay/40" : "border-white/[0.06]"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-bold">{h.summary}</div>
+                    <div className="mt-0.5 text-xs text-muted">
+                      {new Date(h.timestamp).toLocaleTimeString()}
+                    </div>
+                  </div>
+                  {snap.youAreHost && (
+                    <button
+                      onClick={() => setConfirm(h.handNumber)}
+                      className="flex-none rounded-lg border border-white/12 bg-white/[0.04] px-2.5 py-1.5 font-display text-[11.5px] font-bold text-muted-3"
+                    >
+                      Roll back
+                    </button>
+                  )}
+                </div>
+                {snap.youAreHost && confirm === h.handNumber && (
+                  <div className="mt-3 rounded-xl border border-clay/30 bg-clay/10 p-3">
+                    <div className="text-[13.5px] font-bold text-clay-soft">
+                      Roll back to before Hand #{h.handNumber}?
+                    </div>
+                    <div className="mt-0.5 text-[12.5px] leading-snug text-muted-4">
+                      This permanently undoes {later} later hand(s) and restores every
+                      stack to this point.
+                    </div>
+                    <div className="mt-3 flex gap-2.5">
+                      <button
+                        onClick={() => setConfirm(null)}
+                        className="h-10 flex-1 rounded-xl border border-white/14 bg-white/[0.05] font-display text-[13px] font-bold text-cream-2"
+                      >
+                        Keep playing
+                      </button>
+                      <button
+                        onClick={() => {
+                          emit("rollback_hand", { targetHandNumber: h.handNumber });
+                          setConfirm(null);
+                          onClose();
+                        }}
+                        className="h-10 flex-1 rounded-xl bg-clay font-display text-[13px] font-bold text-white"
+                      >
+                        Roll back
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ---------------- cheeky bets ----------------
+const WAGERS = [10, 20, 50];
+
+function CheekyBetModal({
+  snap,
+  onClose,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  onClose: () => void;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const folded = snap.seats.filter(
+    (s) => s.occupied && s.status === "folded" && !s.isYou
+  );
+  const [target, setTarget] = useState<number | null>(folded[0]?.seatIndex ?? null);
+  const [pred, setPred] = useState<CheekyPrediction>("mine-better");
+  const [amount, setAmount] = useState(20);
+  const targetSeat = target !== null ? snap.seats[target] : null;
+
+  const send = () => {
+    if (target === null) return;
+    emit("request_cheeky_bet", {
+      opponentSeatIndex: target,
+      prediction: pred,
+      amount,
+    });
+    onClose();
+  };
+
+  return (
+    <ModalShell onClose={onClose} accent>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-lg text-amber">♦</span>
+          <h2 className="font-display text-xl font-bold">Cheeky bet</h2>
+        </div>
+        <CloseX onClose={onClose} />
+      </div>
+      <p className="mb-4 mt-1.5 text-[13px] leading-snug text-muted">
+        You&apos;ve folded — wager on whose hand wins at showdown. Settles
+        automatically.
+      </p>
+
+      <Label>PICK A FOLDED OPPONENT</Label>
+      <div className="mb-4 flex gap-3">
+        {folded.map((s) => (
+          <button
+            key={s.seatIndex}
+            onClick={() => setTarget(s.seatIndex)}
+            className="flex flex-col items-center gap-1.5"
+          >
+            <Avatar
+              name={s.nickname}
+              className={`h-[52px] w-[52px] rounded-2xl text-base ${
+                target === s.seatIndex ? "ring-2 ring-amber" : "opacity-70"
+              }`}
+            />
+            <span className="text-xs font-semibold text-cream-2">{s.nickname}</span>
+          </button>
+        ))}
+        {folded.length === 0 && (
+          <p className="text-[13px] text-muted">No other folded players right now.</p>
+        )}
+      </div>
+
+      <Label>YOUR CALL</Label>
+      <div className="mb-4 flex gap-2.5">
+        {(
+          [
+            ["mine-better", "My hand wins"],
+            ["theirs-better", "Theirs wins"],
+          ] as const
+        ).map(([v, label]) => (
+          <button
+            key={v}
+            onClick={() => setPred(v)}
+            className={`h-12 flex-1 rounded-xl border font-display text-[13.5px] font-bold ${
+              pred === v
+                ? "border-amber bg-amber/[0.14] text-amber"
+                : "border-white/12 bg-white/[0.04] text-cream-2"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <Label>WAGER</Label>
+      <div className="mb-3.5 flex gap-2.5">
+        {WAGERS.map((v) => (
+          <button
+            key={v}
+            onClick={() => setAmount(v)}
+            className={`h-11 flex-1 rounded-xl font-display text-[15px] font-bold ${
+              amount === v
+                ? "border-[1.5px] border-amber bg-amber/[0.14] text-amber"
+                : "border border-white/12 bg-white/[0.04] text-cream-2"
+            }`}
+          >
+            {v}
+          </button>
+        ))}
+      </div>
+      <InfoNote>Both stakes lock in escrow until the board runs out.</InfoNote>
+      <button
+        onClick={send}
+        disabled={target === null}
+        className="h-14 w-full rounded-2xl bg-amber font-display text-base font-bold text-amber-ink disabled:opacity-40"
+      >
+        Send {amount}-chip bet{targetSeat ? ` to ${targetSeat.nickname}` : ""}
+      </button>
+    </ModalShell>
+  );
+}
+
+function CheekyIncomingModal({
+  req,
+  onClose,
+  emit,
+}: {
+  req: CheekyBetRequestPayload;
+  onClose: () => void;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  // The prediction is the bettor's. "mine-better" => they bet *their* hand wins.
+  const theirHand = req.prediction === "mine-better";
+  const respond = (accept: boolean) => {
+    emit("respond_cheeky_bet", { betId: req.betId, accept });
+    onClose();
+  };
+  return (
+    <ModalShell onClose={onClose} accent>
+      <div className="px-1 text-center">
+        <Avatar
+          name={req.fromNickname}
+          className="mx-auto mb-3.5 h-[60px] w-[60px] rounded-2xl text-xl"
+        />
+        <h2 className="font-display text-xl font-bold">
+          {req.fromNickname} wants a cheeky bet
+        </h2>
+        <p className="mt-2 px-1.5 text-sm leading-relaxed text-muted-4">
+          {req.fromNickname} bets <b className="text-amber">{req.amount}</b> that{" "}
+          <b className="text-cream">{theirHand ? "their" : "your"}</b> hand beats{" "}
+          {theirHand ? "yours" : "theirs"} at showdown.
+        </p>
+      </div>
+      <div className="mt-5 flex gap-2.5">
+        <button
+          onClick={() => respond(false)}
+          className="h-14 flex-1 rounded-2xl border-[1.5px] border-clay/40 bg-clay/10 font-display text-base font-bold text-clay-soft"
+        >
+          Decline
+        </button>
+        <button
+          onClick={() => respond(true)}
+          className="h-14 flex-[1.3] rounded-2xl bg-amber font-display text-base font-bold text-amber-ink"
+        >
+          Accept · {req.amount}
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function CheekySettledModal({
+  settled,
+  onClose,
+}: {
+  settled: CheekyBetSettledPayload;
+  onClose: () => void;
+}) {
+  const push = settled.result === "push";
+  return (
+    <ModalShell onClose={onClose}>
+      <div className="px-1 text-center">
+        <div
+          className={`mx-auto mb-3.5 flex h-16 w-16 items-center justify-center rounded-full text-3xl ${
+            settled.youWon ? "bg-green/[0.16]" : "bg-white/[0.05]"
+          }`}
+        >
+          {push ? "🤝" : settled.youWon ? "🏆" : "😕"}
+        </div>
+        <h2
+          className={`font-display text-xl font-bold ${
+            settled.youWon ? "text-green" : "text-cream"
+          }`}
+        >
+          {push
+            ? "Cheeky bet pushed"
+            : settled.youWon
+            ? "You won the cheeky bet"
+            : "Cheeky bet lost"}
+        </h2>
+        <p className="mt-2 text-sm leading-relaxed text-muted-4">
+          {settled.delta !== 0 && (
+            <b className={settled.youWon ? "text-green" : "text-clay-soft"}>
+              {settled.delta > 0 ? `+${settled.delta}` : settled.delta} chips
+            </b>
+          )}{" "}
+          settled from escrow.
+        </p>
+        <div className="mt-4 rounded-xl border border-white/[0.07] bg-white/[0.03] p-3 text-left text-[12.5px] text-muted">
+          📜 {settled.message}
+        </div>
+      </div>
+      <button
+        onClick={onClose}
+        className="mt-4 h-14 w-full rounded-2xl bg-amber font-display text-base font-bold text-amber-ink"
+      >
+        Back to table
+      </button>
+    </ModalShell>
+  );
+}
+
+// ---------------- card peeks ----------------
+function PeekRequestModal({
+  snap,
+  targetSeatIndex,
+  onClose,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  targetSeatIndex: number;
+  onClose: () => void;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const tgt = snap.seats[targetSeatIndex];
+  const ask = () => {
+    emit("request_card_peek", { targetSeatIndex });
+    onClose();
+  };
+  return (
+    <ModalShell onClose={onClose} center>
+      <Avatar
+        name={tgt.nickname}
+        className="mx-auto mb-3.5 h-[60px] w-[60px] rounded-2xl text-xl"
+      />
+      <h2 className="font-display text-xl font-bold">Peek at {tgt.nickname}&apos;s hand?</h2>
+      <p className="mt-2 px-1 text-[13.5px] leading-relaxed text-muted-4">
+        You&apos;ve both folded, so it&apos;s fair game. {tgt.nickname} has to
+        accept — and only you will see the cards.
+      </p>
+      <div className="mt-5 flex gap-2.5">
+        <button
+          onClick={onClose}
+          className="h-13 flex-1 rounded-2xl border border-white/14 bg-white/[0.05] py-3.5 font-display text-[15px] font-bold text-cream-2"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={ask}
+          className="h-13 flex-[1.3] rounded-2xl bg-amber py-3.5 font-display text-[15px] font-bold text-amber-ink"
+        >
+          Ask to see
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function PeekIncomingModal({
+  req,
+  onClose,
+  emit,
+}: {
+  req: CardPeekRequestEventPayload;
+  onClose: () => void;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const respond = (accept: boolean) => {
+    emit("respond_card_peek", { requestId: req.requestId, accept });
+    onClose();
+  };
+  return (
+    <ModalShell onClose={onClose} center>
+      <div className="mb-3 text-4xl">◉</div>
+      <h2 className="font-display text-xl font-bold">
+        {req.fromNickname} wants to peek
+      </h2>
+      <p className="mt-2 px-1 text-[13.5px] leading-relaxed text-muted-4">
+        You&apos;ve both folded. Show {req.fromNickname} your hand? Only they will
+        see it.
+      </p>
+      <div className="mt-5 flex gap-2.5">
+        <button
+          onClick={() => respond(false)}
+          className="flex-1 rounded-2xl border border-white/14 bg-white/[0.05] py-3.5 font-display text-[15px] font-bold text-cream-2"
+        >
+          Keep hidden
+        </button>
+        <button
+          onClick={() => respond(true)}
+          className="flex-[1.3] rounded-2xl bg-amber py-3.5 font-display text-[15px] font-bold text-amber-ink"
+        >
+          Show them
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function PeekRevealModal({
+  reveal,
+  onClose,
+}: {
+  reveal: CardPeekResultPayload;
+  onClose: () => void;
+}) {
+  return (
+    <ModalShell onClose={onClose} center>
+      <div className="mb-1 flex items-center justify-center gap-2">
+        <Avatar name={reveal.nickname} className="h-7 w-7 rounded-lg text-[11px]" />
+        <h2 className="font-display text-lg font-bold">{reveal.nickname} showed you</h2>
+      </div>
+      <div className="my-6 flex justify-center gap-3">
+        {reveal.holeCards.map((c, i) => (
+          <PlayingCard key={i} card={c} className="h-[104px] w-[74px] text-[34px]" />
+        ))}
+      </div>
+      <div className="inline-flex items-center gap-2 rounded-xl border border-amber/20 bg-amber/[0.10] px-3.5 py-2 text-[12.5px] text-amber-soft">
+        🔒 Private — only you can see this
+      </div>
+      <button
+        onClick={onClose}
+        className="mt-5 h-13 w-full rounded-2xl bg-amber py-3.5 font-display text-[15px] font-bold text-amber-ink"
+      >
+        Done
+      </button>
+    </ModalShell>
+  );
+}
+
+// ---------------- recap ----------------
+function RecapOverlay({
+  recap,
+  onClose,
+  onLeave,
+}: {
+  recap: SessionRecapPayload;
+  onClose: () => void;
+  onLeave: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const mins = Math.round(recap.durationMs / 60000);
+  const medal = (i: number) =>
+    ["#e0a23b", "#cdd6cf", "#b9842a"][i] ?? "#5d6b62";
+
+  const summaryText = () => {
+    const lines = recap.standings.map(
+      (p, i) =>
+        `${i + 1}. ${p.nickname} — ${fmt(p.chips)} (${
+          p.netChips >= 0 ? "+" : ""
+        }${fmt(p.netChips)})`
+    );
+    const biggest = recap.biggestPot
+      ? `Biggest pot: ${fmt(recap.biggestPot.amount)} (Hand #${recap.biggestPot.handNumber})`
+      : "";
+    return `🃏 PokerNight recap — ${recap.handsPlayed} hands\n${biggest}\n\n${lines.join("\n")}`;
+  };
+
+  const copy = () => {
+    navigator.clipboard?.writeText(summaryText());
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  };
+
+  return (
+    <div className="absolute inset-0 z-[60] flex animate-pn-fade flex-col bg-screen">
+      <div className="px-6 pb-2.5 pt-6 text-center">
+        <div className="font-display text-[13px] font-bold tracking-[3px] text-amber">
+          ♠ THAT&apos;S A WRAP
+        </div>
+        <div className="mt-1.5 text-[13px] text-muted">
+          {recap.handsPlayed} hands · {mins}m at the table
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-5 pb-4">
+        <div className="mb-4 flex gap-3">
+          <div className="flex-1 rounded-2xl border border-white/[0.06] bg-field p-3.5">
+            <div className="text-[11px] font-bold tracking-wide text-muted">
+              HANDS PLAYED
+            </div>
+            <div className="mt-1 font-display text-[26px] font-bold">
+              {recap.handsPlayed}
+            </div>
+          </div>
+          <div className="flex-1 rounded-2xl border border-amber/[0.22] bg-gradient-to-br from-amber/[0.16] to-amber/[0.04] p-3.5">
+            <div className="text-[11px] font-bold tracking-wide text-amber-soft">
+              BIGGEST POT
+            </div>
+            <div className="mt-1 font-display text-[26px] font-bold text-amber">
+              {recap.biggestPot ? fmt(recap.biggestPot.amount) : "—"}
+            </div>
+            {recap.biggestPot && (
+              <div className="text-[11px] text-muted">
+                Hand #{recap.biggestPot.handNumber}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="mb-2.5 text-[11.5px] font-bold tracking-wide text-muted">
+          FINAL STANDINGS
+        </div>
+        <div className="flex flex-col gap-2.5">
+          {recap.standings.map((p, i) => (
+            <div
+              key={p.sessionId}
+              className="flex items-center gap-3 rounded-2xl border border-white/[0.06] bg-field p-3"
+            >
+              <div
+                className="w-6 text-center font-display text-[15px] font-bold"
+                style={{ color: medal(i) }}
+              >
+                {i + 1}
+              </div>
+              <Avatar name={p.nickname} className="h-10 w-10 rounded-xl text-sm" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-bold">{p.nickname}</div>
+                <div className="mt-0.5 text-[11.5px] text-muted">
+                  {p.handsWon} won · {p.foldCount} folds · {p.cheekyBetsWon} cheeky
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="font-display text-base font-bold">{fmt(p.chips)}</div>
+                <div
+                  className={`font-display text-xs font-bold ${
+                    p.netChips >= 0 ? "text-green" : "text-clay-soft"
+                  }`}
+                >
+                  {p.netChips >= 0 ? "+" : ""}
+                  {fmt(p.netChips)}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2.5 border-t border-white/[0.06] px-5 pb-7 pt-3.5">
+        <button
+          onClick={copy}
+          className="h-14 w-full rounded-2xl bg-amber font-display text-base font-bold text-amber-ink shadow-[0_8px_22px_rgba(224,162,59,.26)]"
+        >
+          {copied ? "Copied to clipboard ✓" : "Copy summary"}
+        </button>
+        <div className="flex gap-2.5">
+          <button
+            onClick={onClose}
+            className="h-13 flex-1 rounded-2xl border border-white/14 bg-white/[0.04] py-3.5 font-display text-[15px] font-bold text-cream"
+          >
+            Back to table
+          </button>
+          <button
+            onClick={onLeave}
+            className="h-13 flex-1 rounded-2xl border border-white/14 bg-white/[0.04] py-3.5 font-display text-[15px] font-bold text-cream"
+          >
+            Leave
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- small modal primitives ----------------
+function ModalShell({
+  children,
+  onClose,
+  accent = false,
+  center = false,
+}: {
+  children: React.ReactNode;
+  onClose: () => void;
+  accent?: boolean;
+  center?: boolean;
+}) {
+  return (
+    <>
+      <div
+        onClick={onClose}
+        className="absolute inset-0 z-50 animate-pn-fade bg-[rgba(8,12,9,.62)] backdrop-blur-sm"
+      />
+      <div
+        className={`absolute inset-x-4 top-1/2 z-[51] -translate-y-1/2 animate-pn-pop rounded-3xl border bg-panel-2 p-5 shadow-[0_30px_70px_rgba(0,0,0,.6)] ${
+          accent ? "border-amber/25" : "border-white/10"
+        } ${center ? "text-center" : ""}`}
+      >
+        {children}
+      </div>
+    </>
+  );
+}
+
+function CloseX({ onClose }: { onClose: () => void }) {
+  return (
+    <button
+      onClick={onClose}
+      className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/[0.06] text-cream-2"
+    >
+      ✕
+    </button>
+  );
+}
+
+function Label({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="mb-2.5 text-[11.5px] font-bold tracking-wide text-muted">
+      {children}
+    </div>
+  );
+}
+
+function InfoNote({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="mb-4 flex items-center gap-2 rounded-xl border border-amber/20 bg-amber/[0.08] px-3.5 py-2.5 text-[12.5px] text-amber-soft">
+      <span>ⓘ</span> {children}
+    </div>
+  );
+}
