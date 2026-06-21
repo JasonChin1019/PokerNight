@@ -43,6 +43,8 @@ import {
   setSevenDeuce,
   offerBuyIn,
   respondBuyIn,
+  hostBuyIn,
+  transferHost,
   reassignHostIfNeeded,
   TURN_MS,
   type EngineResult,
@@ -224,6 +226,20 @@ export function registerSocketHandlers(io: Server) {
       }
     });
 
+    // busted host buys themselves back in and keeps the badge
+    socket.on("host_buyin", (p: { amount: number }) =>
+      run(io, socket, true, (t) => hostBuyIn(t, socket.data.sessionId, p.amount))
+    );
+
+    // busted host hands the badge to a player who still has chips
+    socket.on("transfer_host", (p: { seatIndex: number }) =>
+      run(io, socket, true, (t) => {
+        const res = transferHost(t, socket.data.sessionId, p.seatIndex);
+        io.in(t.roomCode).emit("host_changed", { nickname: t.seats[p.seatIndex].nickname });
+        return res;
+      })
+    );
+
     // a queued player picks which open seat they'll drop into next hand
     socket.on("choose_seat", (p: { seatIndex: number }) => {
       const t = room(socket);
@@ -314,7 +330,10 @@ export function registerSocketHandlers(io: Server) {
         t.handLog.push(`${s.nickname} left the table.`);
         t.seats[seat] = emptySeat();
         const newHost = reassignHostIfNeeded(t);
-        if (newHost) t.handLog.push(`${newHost} is now the host.`);
+        if (newHost) {
+          t.handLog.push(`${newHost} is now the host.`);
+          io.in(t.roomCode).emit("host_changed", { nickname: newHost });
+        }
       }
       socket.leave(t.roomCode);
       broadcast(io, t);

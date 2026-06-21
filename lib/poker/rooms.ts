@@ -246,6 +246,7 @@ export function buildSnapshot(t: Table, viewerSessionId: string): RoomSnapshot {
     incomingPeekRequests,
     yourBuyInOffer: t.pendingBuyIns[viewerSessionId] ?? null,
     youAreBusted,
+    youMustChooseHost: isHost && youAreBusted,
   };
 
   // Everyone can view hand history (read-only); only the host gets the

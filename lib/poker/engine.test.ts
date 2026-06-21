@@ -8,6 +8,8 @@ import {
   advanceStreet,
   rollbackHand,
   reassignHostIfNeeded,
+  hostBuyIn,
+  transferHost,
   setSevenDeuce,
   requestCheekyBet,
   respondCheekyBet,
@@ -279,14 +281,37 @@ describe("buy-ins and host chip control", () => {
 });
 
 describe("host transfer", () => {
-  it("hands host to a viable seat when the host busts out, no-op otherwise", () => {
+  it("keeps a busted host (they get prompted), auto-reassigns only once they leave", () => {
     const t = seed("chips-only", [1000, 1000]);
     expect(reassignHostIfNeeded(t)).toBeNull(); // host fine → unchanged
     expect(t.hostSessionId).toBe("s0");
 
-    t.seats[0].status = "busted"; // host out of chips, not buying back
+    t.seats[0].status = "busted"; // host out of chips → keeps badge, gets the prompt
+    expect(reassignHostIfNeeded(t)).toBeNull();
+    expect(t.hostSessionId).toBe("s0");
+
+    t.seats[0].status = "empty"; // host actually left the table → hand off
     expect(reassignHostIfNeeded(t)).toBe("P1");
     expect(t.hostSessionId).toBe("s1");
+  });
+
+  it("host buys back in and stays host", () => {
+    const t = seed("chips-only", [1000, 1000]);
+    t.seats[0].chips = 0;
+    t.seats[0].status = "busted";
+    hostBuyIn(t, "s0", 500);
+    expect(t.seats[0].chips).toBe(500);
+    expect(t.seats[0].status).toBe("active"); // round is "waiting"
+    expect(t.hostSessionId).toBe("s0");
+  });
+
+  it("transfers host only to a seated player with chips", () => {
+    const t = seed("chips-only", [1000, 1000]);
+    t.seats[0].status = "busted";
+    transferHost(t, "s0", 1);
+    expect(t.hostSessionId).toBe("s1");
+    // a non-host can't transfer; can't hand off to a busted/empty seat
+    expect(() => transferHost(t, "s0", 0)).toThrow();
   });
 });
 

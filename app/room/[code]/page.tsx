@@ -92,6 +92,7 @@ export default function RoomPage() {
   const [showSetChips, setShowSetChips] = useState(false);
   const [undoPopup, setUndoPopup] = useState<string | null>(null);
   const [rulePopup, setRulePopup] = useState<{ title: string; message: string } | null>(null);
+  const [hostChanged, setHostChanged] = useState<string | null>(null);
   const [cheekyLocked, setCheekyLocked] = useState<string | null>(null);
   const [dealing, setDealing] = useState(false);
   const dealHand = useRef<number | undefined>(undefined);
@@ -153,6 +154,7 @@ export default function RoomPage() {
     socket.on("seven_deuce", (p: SevenDeucePayload) => setSevenDeuceNotice(p));
     socket.on("action_undone", (p: { message: string }) => setUndoPopup(p.message));
     socket.on("rule_changed", (p: { title: string; message: string }) => setRulePopup(p));
+    socket.on("host_changed", (p: { nickname: string }) => setHostChanged(p.nickname));
 
     socket.on("tip_received", (p: { from: string; amount: number }) => {
       setTip(p);
@@ -189,6 +191,7 @@ export default function RoomPage() {
       socket.off("seven_deuce");
       socket.off("action_undone");
       socket.off("rule_changed");
+      socket.off("host_changed");
       socket.off("tip_received");
       socket.off("player_acted");
     };
@@ -459,6 +462,10 @@ export default function RoomPage() {
       )}
       {rulePopup && (
         <RuleChangePopup popup={rulePopup} onClose={() => setRulePopup(null)} />
+      )}
+      {snap.youMustChooseHost && <HostDecisionModal snap={snap} emit={emit} />}
+      {hostChanged && (
+        <HostChangedPopup nickname={hostChanged} onClose={() => setHostChanged(null)} />
       )}
 
       {tip && (
@@ -1865,9 +1872,11 @@ function BottomArea({
     !me.revealed &&
     (me.status === "active" || me.status === "all-in" || me.status === "folded");
 
-  // between hands / waiting for others (bottom bar sits a touch higher: pb-10)
+  // between hands / waiting for others (bottom bar sits a touch higher: pb-10).
+  // Transparent gradient (not a solid bar) so it stops covering the player's own
+  // chips on short screens — the felt shows through the top, text stays readable.
   return (
-    <div className="z-20 border-t border-white/[0.06] bg-bar px-5 pb-10 pt-4">
+    <div className="z-20 bg-gradient-to-t from-screen/90 via-screen/55 to-transparent px-5 pb-10 pt-6">
       <div className="flex items-center justify-between">
         <span className="text-[13px] text-muted">
           {snap.round === "waiting"
@@ -2844,6 +2853,138 @@ function BuyInOffer({
         </div>
       </div>
     </>
+  );
+}
+
+// The host busted out: buy back in (and stay host) or hand the badge to a
+// player who still has chips. Blocking — there's no dismiss; the host must pick.
+function HostDecisionModal({
+  snap,
+  emit,
+}: {
+  snap: RoomSnapshot;
+  emit: (e: string, p?: unknown) => void;
+}) {
+  const candidates = snap.seats.filter((s) => s.occupied && !s.isYou && s.chips > 0);
+  const [mode, setMode] = useState<"choose" | "buyin" | "transfer">("choose");
+  const [amount, setAmount] = useState(snap.buyIn || 100);
+  const [target, setTarget] = useState<number | null>(candidates[0]?.seatIndex ?? null);
+
+  return (
+    <>
+      <div className="absolute inset-0 z-[58] animate-pn-fade bg-[rgba(8,12,9,.78)] backdrop-blur-sm" />
+      <div className="absolute inset-x-4 top-1/2 z-[59] -translate-y-1/2 animate-pn-pop rounded-3xl border border-amber/30 bg-panel-2 p-6 shadow-[0_30px_70px_rgba(0,0,0,.6)]">
+        <div className="mb-1 text-center text-3xl">👑</div>
+        <h2 className="text-center font-display text-xl font-bold">You&apos;re out of chips</h2>
+        <p className="mb-5 mt-1 text-center text-[13px] text-muted">
+          You&apos;re the host. Buy back in to keep hosting, or hand the badge to another player.
+        </p>
+
+        {mode === "choose" && (
+          <div className="flex flex-col gap-2.5">
+            <button
+              onClick={() => setMode("buyin")}
+              className="h-12 w-full rounded-xl bg-amber font-display text-[15px] font-bold text-amber-ink"
+            >
+              Buy back in
+            </button>
+            <button
+              onClick={() => setMode("transfer")}
+              disabled={candidates.length === 0}
+              className="h-12 w-full rounded-xl border border-white/12 font-display text-[15px] font-bold text-cream-2 disabled:opacity-40"
+            >
+              Transfer host{candidates.length === 0 ? " (no one with chips)" : ""}
+            </button>
+          </div>
+        )}
+
+        {mode === "buyin" && (
+          <div className="flex flex-col gap-2.5">
+            <input
+              type="number"
+              min={1}
+              value={amount}
+              autoFocus
+              onChange={(e) => setAmount(Math.max(1, +e.target.value))}
+              className="input font-display font-bold text-amber"
+            />
+            <button
+              onClick={() => emit("host_buyin", { amount })}
+              disabled={amount <= 0}
+              className="h-12 w-full rounded-xl bg-amber font-display text-[15px] font-bold text-amber-ink disabled:opacity-40"
+            >
+              Buy in {amount} &amp; stay host
+            </button>
+            <button
+              onClick={() => setMode("choose")}
+              className="h-11 w-full rounded-xl border border-white/12 font-display text-sm font-bold text-cream-2"
+            >
+              Back
+            </button>
+          </div>
+        )}
+
+        {mode === "transfer" && (
+          <div className="flex flex-col gap-2.5">
+            <div className="flex gap-2.5 overflow-x-auto px-1 py-1.5">
+              {candidates.map((s) => (
+                <button
+                  key={s.seatIndex}
+                  onClick={() => setTarget(s.seatIndex)}
+                  className="flex flex-none flex-col items-center gap-1.5"
+                >
+                  <Avatar
+                    name={s.nickname}
+                    className={`h-[52px] w-[52px] rounded-full text-base ${
+                      target === s.seatIndex
+                        ? "ring-2 ring-amber ring-offset-2 ring-offset-panel-2"
+                        : "opacity-70"
+                    }`}
+                  />
+                  <span className="text-[11px] text-muted">{s.nickname}</span>
+                  <span className="text-[11px] font-bold text-cream-2">{s.chips}</span>
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => target !== null && emit("transfer_host", { seatIndex: target })}
+              disabled={target === null}
+              className="h-12 w-full rounded-xl bg-amber font-display text-[15px] font-bold text-amber-ink disabled:opacity-40"
+            >
+              Make {target !== null ? snap.seats[target]?.nickname : ""} host
+            </button>
+            <button
+              onClick={() => setMode("choose")}
+              className="h-11 w-full rounded-xl border border-white/12 font-display text-sm font-bold text-cream-2"
+            >
+              Back
+            </button>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// Room-wide popup announcing the host changed (auto-dismisses).
+function HostChangedPopup({ nickname, onClose }: { nickname: string; onClose: () => void }) {
+  useEffect(() => {
+    const id = setTimeout(onClose, 4000);
+    return () => clearTimeout(id);
+  }, [onClose]);
+  return (
+    <div className="pointer-events-none absolute inset-x-0 top-24 z-[90] flex justify-center px-6">
+      <div
+        onClick={onClose}
+        className="pointer-events-auto flex max-w-sm animate-pn-pop items-center gap-3 rounded-2xl border border-amber/40 bg-panel-2 px-4 py-3 shadow-[0_18px_44px_rgba(0,0,0,.55)]"
+      >
+        <span className="text-xl">👑</span>
+        <div>
+          <div className="font-display text-sm font-bold text-amber">Host changed</div>
+          <div className="mt-0.5 text-[13px] text-cream-2">{nickname} is now the host.</div>
+        </div>
+      </div>
+    </div>
   );
 }
 

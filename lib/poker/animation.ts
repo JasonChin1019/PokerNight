@@ -26,10 +26,11 @@ export function getAnimationTier(handName?: string | null): AnimationTier {
   return "neutral";
 }
 
+// Kept at/under 2s so the badge never lingers over the cards on mobile.
 export const TIER_DURATION_MS: Record<AnimationTier, number> = {
   bluff: 1100,
   small: 1000,
   medium: 1500,
-  monster: 2500,
+  monster: 2000,
   neutral: 600,
 };

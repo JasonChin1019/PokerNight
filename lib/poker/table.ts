@@ -660,15 +660,44 @@ export function respondBuyIn(t: Table, sessionId: string, accept: boolean): Engi
     log(r, t, `${s.nickname} declined the buy-in.`);
     return r;
   }
+  applyBuyIn(t, s, amount);
+  log(r, t, `${s.nickname} bought in for ${amount}${t.round === "waiting" ? "" : " — in next hand"}.`);
+  return r;
+}
+
+// Add chips and, if it pulls them off zero, bring a busted/sitting-out player
+// back. Mid-hand they can't be dealt in — stay sitting-out so the next startHand
+// seats them; don't drop them into a live hand with no cards.
+function applyBuyIn(t: Table, s: Seat, amount: number) {
   s.chips += amount;
   s.buyInTotal += amount;
-  // Bring a busted/sitting-out player back. Mid-hand they can't be dealt in —
-  // stay sitting-out so the next startHand seats them; don't drop them into a
-  // live hand with no cards.
   if (s.chips > 0 && (s.status === "busted" || s.status === "sitting-out")) {
     s.status = t.round === "waiting" ? "active" : "sitting-out";
   }
-  log(r, t, `${s.nickname} bought in for ${amount}${t.round === "waiting" ? "" : " — in next hand"}.`);
+}
+
+// The busted host buys themselves back in and keeps the badge.
+export function hostBuyIn(t: Table, sessionId: string, amount: number): EngineResult {
+  const r: EngineResult = { logs: [] };
+  if (sessionId !== t.hostSessionId) throw new Error("Only the host can do that.");
+  amount = Math.round(amount);
+  if (amount <= 0) throw new Error("Buy-in must be positive.");
+  const s = t.seats.find((x) => x.sessionId === sessionId && x.status !== "empty");
+  if (!s) throw new Error("No host seat.");
+  applyBuyIn(t, s, amount);
+  log(r, t, `${s.nickname} bought back in for ${amount} and stays host.`);
+  return r;
+}
+
+// The host hands the badge to a seated player who still has chips.
+export function transferHost(t: Table, fromSessionId: string, toSeatIndex: number): EngineResult {
+  const r: EngineResult = { logs: [] };
+  if (fromSessionId !== t.hostSessionId) throw new Error("Only the host can do that.");
+  const s = t.seats[toSeatIndex];
+  if (!s || !s.sessionId || s.status === "empty" || s.status === "busted")
+    throw new Error("Pick a player who's still in.");
+  t.hostSessionId = s.sessionId;
+  log(r, t, `${s.nickname} is now the host.`);
   return r;
 }
 
@@ -685,12 +714,14 @@ function bustOutBrokePlayers(t: Table, r: EngineResult) {
   }
 }
 
-// Hand the host badge to a viable seated player when the current host can no
-// longer run the game (busted out or left). Returns the new host's nickname,
-// or null if the host is still seated or nobody can take over.
+// Hand the host badge to a viable seated player when the current host has left
+// the table. Returns the new host's nickname, or null if the host still holds a
+// seat (even busted — they get the buy-in/transfer prompt) or nobody can take over.
 export function reassignHostIfNeeded(t: Table): string | null {
   const cur = t.seats.find((s) => s.sessionId === t.hostSessionId);
-  if (cur && cur.status !== "empty" && cur.status !== "busted") return null;
+  // A busted host keeps the badge and is prompted (socket layer) to buy back in
+  // or hand off. Only auto-reassign once the host has truly left the table.
+  if (cur && cur.status !== "empty") return null;
   const next = t.seats.find(
     (s) => s.sessionId !== "" && s.status !== "empty" && s.status !== "busted"
   );

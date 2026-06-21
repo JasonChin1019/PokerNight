@@ -155,6 +155,12 @@ const config: Config = {
           "25%": { transform: "translate(-2px,1px) rotate(-3deg)" },
           "75%": { transform: "translate(2px,-1px) rotate(3deg)" },
         },
+        // win-animation badge holds, then zips up & fades out (so it stops
+        // covering the cards on small screens). Duration is set per-tier inline.
+        "pn-zip-out": {
+          "0%,68%": { opacity: "1", transform: "translateY(0) scale(1)" },
+          "100%": { opacity: "0", transform: "translateY(-44px) scale(.7)" },
+        },
         // loser tears falling
         "pn-drip": {
           "0%": { transform: "translateY(0) scale(.6)", opacity: "0" },
@@ -179,6 +185,7 @@ const config: Config = {
         "pn-rise": "pn-rise 1.1s ease-out infinite",
         "pn-slam": "pn-slam .5s cubic-bezier(.2,1.5,.4,1) forwards",
         "pn-jitter": "pn-jitter .18s ease-in-out infinite",
+        "pn-zip-out": "pn-zip-out 2s ease-in forwards",
         "pn-drip": "pn-drip 1.4s ease-in infinite",
       },
     },

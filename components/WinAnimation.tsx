@@ -49,7 +49,10 @@ export function WinAnimation({
   const spinCards = (cards ?? []).slice(0, tier === "medium" ? 4 : 2);
 
   return (
-    <div className="pointer-events-none absolute inset-x-0 top-[120px] z-[42] flex flex-col items-center">
+    <div
+      className="animate-pn-zip-out pointer-events-none absolute inset-x-0 top-[120px] z-[42] flex flex-col items-center"
+      style={{ animationDuration: `${TIER_DURATION_MS[tier]}ms` }}
+    >
       {tier === "monster" && (
         <>
           <div className="absolute inset-x-0 -top-40 bottom-[-200px] overflow-hidden">

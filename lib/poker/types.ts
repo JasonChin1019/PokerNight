@@ -233,6 +233,7 @@ export type RoomSnapshot = {
   // chips the host has offered the viewer as a buy-in, awaiting their accept/decline
   yourBuyInOffer: number | null;
   youAreBusted: boolean; // viewer is out of chips, spectating until they buy back in
+  youMustChooseHost: boolean; // viewer is the host but busted → buy back in or hand off
 };
 
 // ----- socket event payloads (shared by client + server) -----
