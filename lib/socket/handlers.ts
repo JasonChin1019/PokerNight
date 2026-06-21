@@ -18,7 +18,13 @@ import {
   addSpectator,
   removeSpectator,
   seatBySession,
+  enqueuePlayer,
+  removeFromQueue,
+  drainQueue,
+  inQueue,
+  chooseQueueSeat,
 } from "../poker/rooms";
+import { emptySeat } from "../poker/types";
 import {
   startHand,
   applyAction,
@@ -27,11 +33,17 @@ import {
   donateChips,
   rollbackHand,
   undoLastAction,
+  swapSeats,
   requestCheekyBet,
   respondCheekyBet,
   requestCardPeek,
   respondCardPeek,
+  revealHand,
   endGame,
+  setSevenDeuce,
+  offerBuyIn,
+  respondBuyIn,
+  reassignHostIfNeeded,
   TURN_MS,
   type EngineResult,
   type CheekySettlement,
@@ -53,6 +65,7 @@ export function registerSocketHandlers(io: Server) {
           smallBlind: p.smallBlind,
           bigBlind: p.bigBlind,
           turnMs: p.turnSeconds != null ? p.turnSeconds * 1000 : undefined,
+          sevenDeuce: p.sevenDeuce,
         });
         seatPlayer(t, p.sessionId, p.nickname, socket.id);
         bind(socket, t.roomCode, p.sessionId);
@@ -69,6 +82,15 @@ export function registerSocketHandlers(io: Server) {
         if (!t) throw new Error("Room not found — check the code.");
         if (p.role === "spectator") {
           addSpectator(t, p.sessionId, p.nickname, socket.id);
+        } else if (seatBySession(t, p.sessionId) >= 0) {
+          // reclaiming an existing seat (reconnect) — always allowed
+          seatPlayer(t, p.sessionId, p.nickname, socket.id);
+          removeSpectator(t, p.sessionId);
+          removeFromQueue(t, p.sessionId);
+        } else if (t.handNumber > 0) {
+          // game already underway: queue + spectate until the next hand
+          addSpectator(t, p.sessionId, p.nickname, socket.id);
+          enqueuePlayer(t, p.sessionId, p.nickname, socket.id);
         } else {
           seatPlayer(t, p.sessionId, p.nickname, socket.id);
           removeSpectator(t, p.sessionId);
@@ -81,7 +103,12 @@ export function registerSocketHandlers(io: Server) {
       }
     });
 
-    socket.on("start_hand", () => run(io, socket, true, (t) => startHand(t)));
+    socket.on("start_hand", () =>
+      run(io, socket, true, (t) => {
+        drainQueue(t); // seat anyone who joined since the last hand
+        return startHand(t);
+      })
+    );
 
     socket.on("player_action", (p: PlayerActionPayload) =>
       run(io, socket, false, (t) => {
@@ -100,10 +127,21 @@ export function registerSocketHandlers(io: Server) {
 
     socket.on("advance_street", () => run(io, socket, true, (t) => advanceStreet(t)));
 
+    // a player flips their own hand face-up for the table, between hands
+    socket.on("reveal_hand", () =>
+      run(io, socket, false, (t) => {
+        const seat = seatBySession(t, socket.data.sessionId);
+        if (seat < 0) throw new Error("You're not seated.");
+        return revealHand(t, seat);
+      })
+    );
+
     socket.on(
       "award_pot",
-      (p: { winningSeatIndexes: number[]; handCategory?: string }) =>
-        run(io, socket, true, (t) => awardPot(t, p.winningSeatIndexes, p.handCategory))
+      (p: { winningSeatIndexes: number[]; handCategory?: string; sevenDeuce?: boolean }) =>
+        run(io, socket, true, (t) =>
+          awardPot(t, p.winningSeatIndexes, p.handCategory, p.sevenDeuce)
+        )
     );
 
     socket.on(
@@ -129,9 +167,70 @@ export function registerSocketHandlers(io: Server) {
       run(io, socket, true, (t) => rollbackHand(t, p.targetHandNumber))
     );
 
-    socket.on("undo_last_action", () =>
-      run(io, socket, true, (t) => undoLastAction(t))
+    socket.on("undo_last_action", () => {
+      const t = room(socket);
+      if (!t) return socket.emit("error", { message: "You're not in a room." });
+      if (t.hostSessionId !== socket.data.sessionId)
+        return socket.emit("error", { message: "Only the host can do that." });
+      try {
+        const result = undoLastAction(t);
+        // dedicated popup so the host sees exactly what was reverted
+        io.in(t.roomCode).emit("action_undone", {
+          message: result.logs[result.logs.length - 1] ?? "Undid the last action.",
+        });
+        emitResult(io, t, result);
+        broadcast(io, t);
+      } catch (e) {
+        fail(socket, undefined, e);
+      }
+    });
+
+    // host rearranges seats between hands (move a player, or swap two)
+    socket.on("swap_seats", (p: { a: number; b: number }) =>
+      run(io, socket, true, (t) => swapSeats(t, p.a, p.b))
     );
+
+    // host toggles/edits the 7-2 rule mid-game
+    socket.on("set_seven_deuce", (p: { amount: number }) =>
+      run(io, socket, true, (t) => {
+        const deferred = t.round !== "waiting"; // a hand is live → only next round
+        const res = setSevenDeuce(t, p.amount);
+        const amt = Math.max(0, Math.round(p.amount));
+        io.in(t.roomCode).emit("rule_changed", {
+          title: amt > 0 ? "7-2 rule turned ON" : "7-2 rule turned OFF",
+          message:
+            (amt > 0 ? `Win with offsuit 7-2 and everyone pays ${amt} chips. ` : "") +
+            (deferred
+              ? "Applies to the NEXT hand — the current hand is unaffected."
+              : "Applies to the next hand."),
+        });
+        return res;
+      })
+    );
+
+    // host offers a player a buy-in; player accepts/declines on their screen
+    socket.on("offer_buyin", (p: { seatIndex: number; amount: number }) =>
+      run(io, socket, true, (t) => offerBuyIn(t, p.seatIndex, p.amount))
+    );
+
+    socket.on("respond_buyin", (p: { accept: boolean }) => {
+      const t = room(socket);
+      if (!t) return socket.emit("error", { message: "You're not in a room." });
+      try {
+        emitResult(io, t, respondBuyIn(t, socket.data.sessionId, p.accept));
+        broadcast(io, t);
+      } catch (e) {
+        fail(socket, undefined, e);
+      }
+    });
+
+    // a queued player picks which open seat they'll drop into next hand
+    socket.on("choose_seat", (p: { seatIndex: number }) => {
+      const t = room(socket);
+      if (!t) return;
+      chooseQueueSeat(t, socket.data.sessionId, p.seatIndex);
+      broadcast(io, t);
+    });
 
     // ----- cheeky bets (full-deal only) -----
     socket.on("request_cheeky_bet", (p: RequestCheekyBetPayload) =>
@@ -204,8 +303,19 @@ export function registerSocketHandlers(io: Server) {
       const t = room(socket);
       if (!t) return;
       removeSpectator(t, socket.data.sessionId);
+      removeFromQueue(t, socket.data.sessionId);
       const seat = seatBySession(t, socket.data.sessionId);
-      if (seat >= 0) t.seats[seat].socketId = null; // keep seat for reconnect
+      if (seat >= 0) {
+        const s = t.seats[seat];
+        // Pulling a seat mid-hand would corrupt the pot/turn order. Busted
+        // players hold no stake in the live hand, so they may leave anytime.
+        if (s.status !== "busted" && t.round !== "waiting")
+          return socket.emit("error", { message: "You can only leave between hands." });
+        t.handLog.push(`${s.nickname} left the table.`);
+        t.seats[seat] = emptySeat();
+        const newHost = reassignHostIfNeeded(t);
+        if (newHost) t.handLog.push(`${newHost} is now the host.`);
+      }
       socket.leave(t.roomCode);
       broadcast(io, t);
     });
@@ -216,9 +326,9 @@ export function registerSocketHandlers(io: Server) {
       const seat = seatBySession(t, socket.data.sessionId);
       if (seat >= 0 && t.seats[seat].socketId === socket.id) {
         t.seats[seat].socketId = null;
-        t.seats[seat].disconnectedAt = Date.now();
       }
       removeSpectator(t, socket.data.sessionId);
+      removeFromQueue(t, socket.data.sessionId);
       broadcast(io, t);
     });
   });
@@ -304,7 +414,8 @@ function broadcastEquity(io: Server, t: Table, sockets: { emit: Function; data: 
     .map(({ s, i }) => ({ seatIndex: i, hole: s.holeCards! }));
   const perSeatWinPct = estimateEquity(contenders, t.communityCards);
   for (const s of sockets) {
-    if (seatBySession(t, s.data.sessionId) < 0) {
+    // pure spectators only — not seated, not queued to join
+    if (seatBySession(t, s.data.sessionId) < 0 && !inQueue(t, s.data.sessionId)) {
       s.emit("equity_update", { perSeatWinPct });
     }
   }
@@ -328,6 +439,7 @@ function emitResult(io: Server, t: Table, result: EngineResult) {
     io.in(t.roomCode).emit("hand_result", payload);
   }
   if (result.cheeky?.length) emitCheekySettlements(io, t, result.cheeky);
+  if (result.sevenDeuce) io.in(t.roomCode).emit("seven_deuce", result.sevenDeuce);
 }
 
 // A settled cheeky bet is private to its two players — each gets their own
@@ -344,6 +456,9 @@ function emitCheekySettlements(io: Server, t: Table, settlements: CheekySettleme
         result: s.result,
         youWon: s.bettorDelta > 0,
         delta: s.bettorDelta,
+        amount: s.amount,
+        youNickname: s.bettorNickname,
+        themNickname: s.opponentNickname,
         message: s.message,
       });
     if (oSock)
@@ -352,6 +467,9 @@ function emitCheekySettlements(io: Server, t: Table, settlements: CheekySettleme
         result: s.result,
         youWon: s.opponentDelta > 0,
         delta: s.opponentDelta,
+        amount: s.amount,
+        youNickname: s.opponentNickname,
+        themNickname: s.bettorNickname,
         message: s.message,
       });
   }

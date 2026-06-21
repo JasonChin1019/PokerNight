@@ -26,6 +26,7 @@ export type SeatStatus =
   | "folded"
   | "all-in"
   | "sitting-out"
+  | "busted" // out of chips: off the table, spectating until a host buy-in is accepted
   | "empty";
 
 export type Round =
@@ -42,18 +43,27 @@ export type Seat = {
   nickname: string;
   chips: number;
   holeCards: [Card, Card] | null; // always null in chips-only mode
+  revealed: boolean; // player voluntarily showed their hand between hands (full-deal)
   status: SeatStatus;
   currentBet: number; // chips put in on the current street; resets each street
   committed: number; // total chips put in across the whole hand; powers side pots
+  buyInTotal: number; // lifetime chips bought in (initial + host gives - takes); drives recap up/down
   hasActed: boolean;
-  // bookkeeping not in the original spec but needed for grace-period auto-fold
-  disconnectedAt: number | null;
 };
 
 export type Spectator = {
   socketId: string;
   sessionId: string;
   nickname: string;
+};
+
+// A player who joined mid-game: spectates until the next hand drains them
+// into an open seat (see rooms.drainQueue). New players can't sit mid-hand.
+export type QueueEntry = {
+  sessionId: string;
+  nickname: string;
+  socketId: string;
+  preferredSeat?: number; // seat they picked while waiting; falls back to first open
 };
 
 export type SidePot = { amount: number; eligibleSeatIndexes: number[] };
@@ -92,7 +102,6 @@ export type SeatStats = {
   nickname: string;
   handsWon: number;
   foldCount: number;
-  netChips: number; // current chips minus total buy-ins/rebuys
   cheekyBetsWon: number;
 };
 
@@ -109,15 +118,19 @@ export type Table = {
   maxSeats: number; // 2–9, set at creation, default 6
   seats: Seat[];
   spectators: Spectator[];
+  queue: QueueEntry[]; // joined mid-game; seated at next hand (FIFO)
   deck: Card[]; // unused in chips-only mode
   communityCards: Card[]; // unused in chips-only mode
   pot: number;
-  sidePots: SidePot[];
   tipJar: number;
   dealerIndex: number;
+  sbIndex: number;
+  bbIndex: number;
   smallBlind: number;
   bigBlind: number;
   buyIn: number;
+  sevenDeuce: number; // 7-2 rule: chips each other player pays a winner holding offsuit 7-2. 0 = off
+  pendingSevenDeuce: number | null; // rule change made mid-hand, applied at the next startHand
   round: Round;
   currentActorIndex: number;
   minRaise: number;
@@ -130,6 +143,7 @@ export type Table = {
   // new-feature state
   cheekyBets: CheekyBet[]; // reset each hand; full-deal only
   cardPeekRequests: CardPeekRequest[]; // reset each hand; full-deal only
+  pendingBuyIns: Record<string, number>; // sessionId → chips the host offered, awaiting accept/decline
   sessionStats: SessionStats;
   createdAt: number; // for recap "time at the table"
 };
@@ -159,10 +173,13 @@ export type PublicSeat = {
   status: SeatStatus;
   currentBet: number;
   holeCards: Card[] | null; // null unless revealed to this viewer
+  revealed: boolean; // this seat voluntarily showed its hand (drives the flip animation)
   connected: boolean;
   isYou: boolean;
   isHost: boolean;
   isDealer: boolean;
+  isSmallBlind: boolean;
+  isBigBlind: boolean;
   isActor: boolean;
 };
 
@@ -193,14 +210,18 @@ export type RoomSnapshot = {
   smallBlind: number;
   bigBlind: number;
   buyIn: number;
+  sevenDeuce: number; // 7-2 rule payout per player; 0 = off
   minRaise: number;
   handNumber: number;
   turnSeconds: number; // configured per-turn limit in seconds; 0 = no timer
   turnDeadline: number | null;
   seats: PublicSeat[];
   spectatorCount: number;
+  queue: string[]; // nicknames waiting to be dealt in, in order
   youAreHost: boolean;
   youAreSpectator: boolean;
+  youAreQueued: boolean; // spectating but waiting for a seat next hand
+  yourQueuedSeat: number | null; // seat you picked while queued, if any
   yourSeatIndex: number | null;
   log: string[];
   // new-feature, viewer-scoped (full-deal only; absent/empty otherwise)
@@ -209,6 +230,9 @@ export type RoomSnapshot = {
   // host-only extras
   handHistory?: { handNumber: number; summary: string; timestamp: number }[];
   canUndo?: boolean;
+  // chips the host has offered the viewer as a buy-in, awaiting their accept/decline
+  yourBuyInOffer: number | null;
+  youAreBusted: boolean; // viewer is out of chips, spectating until they buy back in
 };
 
 // ----- socket event payloads (shared by client + server) -----
@@ -222,6 +246,7 @@ export type CreateRoomPayload = {
   smallBlind: number;
   bigBlind: number;
   turnSeconds?: number; // per-turn time limit; 0 or undefined handled by server default
+  sevenDeuce?: number; // 7-2 rule payout per player; 0/undefined = off
 };
 
 export type JoinRoomPayload = {
@@ -268,8 +293,12 @@ export type CheekyBetSettledPayload = {
   result: NonNullable<CheekyBet["result"]>;
   youWon: boolean;
   delta: number; // chips gained (+) or lost (−) for the recipient
+  amount: number; // the wager size
+  youNickname: string; // recipient's own name
+  themNickname: string; // the other party's name
   message: string;
 };
+export type SevenDeucePayload = { winners: string[]; perPlayer: number };
 export type CardPeekRequestEventPayload = { requestId: string; fromNickname: string };
 export type CardPeekResultPayload = {
   targetSeatIndex: number;
@@ -282,6 +311,7 @@ export type RecapStanding = {
   sessionId: string;
   nickname: string;
   chips: number;
+  buyIn: number; // total bought in over the session
   netChips: number;
   handsWon: number;
   foldCount: number;
@@ -302,10 +332,11 @@ export function emptySeat(): Seat {
     nickname: "",
     chips: 0,
     holeCards: null,
+    revealed: false,
     status: "empty",
     currentBet: 0,
     committed: 0,
+    buyInTotal: 0,
     hasActed: false,
-    disconnectedAt: null,
   };
 }

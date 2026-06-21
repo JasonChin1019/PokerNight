@@ -31,8 +31,7 @@ export default function Landing() {
             Poker<span className="text-amber">Night</span>
           </h1>
           <p className="mt-3 max-w-[280px] text-base leading-relaxed text-muted">
-            Your group&apos;s virtual chip table. Gather the crew, deal the cards —
-            or just track the chips.
+            Your group&apos;s virtual table. Chips or Cards, we have it both.
           </p>
         </div>
       </div>
@@ -51,7 +50,7 @@ export default function Landing() {
           Join game
         </Link>
         <p className="mt-1.5 text-center text-xs text-muted-2">
-          Play money only · No real cash, ever
+          Pocket Rockets guaranteed if you pay the developer.
         </p>
       </div>
     </main>

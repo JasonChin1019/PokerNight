@@ -1,16 +1,9 @@
 "use client";
 
 import { useEffect, useMemo } from "react";
-import type { Card as TCard, Suit } from "@/lib/poker/types";
+import type { Card as TCard } from "@/lib/poker/types";
 import { type AnimationTier, TIER_DURATION_MS } from "@/lib/poker/animation";
-
-const SUIT_SYMBOL: Record<Suit, string> = {
-  hearts: "♥",
-  diamonds: "♦",
-  clubs: "♣",
-  spades: "♠",
-};
-const isRed = (s: Suit) => s === "hearts" || s === "diamonds";
+import { SUIT_SYMBOL, isRed } from "./Card";
 
 const BADGE: Record<AnimationTier, string | null> = {
   bluff: "BLUFF CAUGHT",

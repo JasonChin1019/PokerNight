@@ -16,6 +16,9 @@ export default function CreatePage() {
   const [bigBlind, setBigBlind] = useState(20);
   const [turnSeconds, setTurnSeconds] = useState(30); // 0 = no timer
   const [realCards, setRealCards] = useState(false);
+  const [ruleOn, setRuleOn] = useState(false); // 7-2 rule toggle
+  const [ruleAmount, setRuleAmount] = useState(50);
+  const sevenDeuce = ruleOn ? ruleAmount : 0;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -36,6 +39,7 @@ export default function CreatePage() {
         smallBlind,
         bigBlind,
         turnSeconds,
+        sevenDeuce,
       },
       (r: { ok: boolean; roomCode?: string; message?: string }) => {
         if (r.ok && r.roomCode) router.push(`/room/${r.roomCode}`);
@@ -200,6 +204,47 @@ export default function CreatePage() {
             ? "♣ Card settings hidden — you'll deal a real deck. The app tracks chips, blinds & the pot only."
             : "◆ Online dealing — the app shuffles, deals, evaluates hands and runs the showdown for you. 20s turn timer."}
         </div>
+
+        <Field label="CUSTOM RULES">
+            <div
+              className={`rounded-2xl border p-4 ${
+                ruleOn ? "border-amber/35 bg-amber/10" : "border-white/[0.08] bg-white/[0.03]"
+              }`}
+            >
+              <button
+                onClick={() => setRuleOn((v) => !v)}
+                className="flex w-full items-start gap-3 text-left"
+              >
+                <span
+                  className={`mt-0.5 flex h-6 w-6 flex-none items-center justify-center rounded-lg border-2 text-[15px] font-extrabold text-amber-ink ${
+                    ruleOn ? "border-amber bg-amber" : "border-white/30"
+                  }`}
+                >
+                  {ruleOn ? "✓" : ""}
+                </span>
+                <span>
+                  <span className="block font-bold">7-2 rule</span>
+                  <span className="mt-0.5 block text-[13px] leading-snug text-muted">
+                    Win a hand holding an offsuit 7 and 2 and every other player pays you the amount below.
+                  </span>
+                </span>
+              </button>
+              {ruleOn && (
+                <div className="mt-4">
+                  <div className="mb-1.5 text-[12.5px] font-semibold tracking-wide text-muted">
+                    CHIPS FROM EACH PLAYER
+                  </div>
+                  <input
+                    type="number"
+                    min={1}
+                    value={ruleAmount}
+                    onChange={(e) => setRuleAmount(Math.max(1, +e.target.value))}
+                    className="input font-display font-bold text-amber"
+                  />
+                </div>
+              )}
+            </div>
+          </Field>
 
         {err && <p className="text-sm text-clay-soft">{err}</p>}
       </div>

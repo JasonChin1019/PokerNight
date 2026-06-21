@@ -7,11 +7,20 @@ import {
   awardPot,
   advanceStreet,
   rollbackHand,
+  reassignHostIfNeeded,
+  setSevenDeuce,
   requestCheekyBet,
   respondCheekyBet,
+  offerBuyIn,
+  respondBuyIn,
+  buildRecap,
+  potBreakdown,
+  revealHand,
 } from "./table";
+import { buildSnapshot } from "./rooms";
 import { getAnimationTier } from "./animation";
-import type { Table } from "./types";
+import { enqueuePlayer, drainQueue, seatBySession } from "./rooms";
+import { emptySeat, type Table } from "./types";
 
 // Seat n players with given chips into a fresh table (test helper only).
 function seed(mode: "full-deal" | "chips-only", chips: number[]): Table {
@@ -31,11 +40,12 @@ function seed(mode: "full-deal" | "chips-only", chips: number[]): Table {
       nickname: `P${i}`,
       chips: c,
       holeCards: null,
+      revealed: false,
       status: "sitting-out",
       currentBet: 0,
       committed: 0,
+      buyInTotal: c,
       hasActed: false,
-      disconnectedAt: null,
     };
   });
   return t;
@@ -87,6 +97,218 @@ describe("full-deal hand", () => {
     expect(t.round).toBe("waiting");
     expect(t.seats.reduce((n, s) => n + s.chips, 0)).toBe(3000);
   });
+
+  it("reveals a folded hand to the whole table between hands", () => {
+    const t = seed("full-deal", [1000, 1000, 1000]);
+    startHand(t);
+    // seat 0 (the requester) folds, hand plays out, we're now between hands.
+    applyAction(t, t.currentActorIndex, { type: "fold" });
+    applyAction(t, t.currentActorIndex, { type: "fold" });
+    expect(t.round).toBe("waiting");
+    // A folded player's own cards are hidden until they choose to reveal.
+    const folded = t.seats.findIndex((s) => s.status === "folded");
+    expect(buildSnapshot(t, `s${folded}`).seats[folded].holeCards).toBeNull();
+    revealHand(t, folded);
+    // Now everyone — even an unrelated viewer — sees those cards face-up.
+    const seen = buildSnapshot(t, "s1").seats[folded];
+    expect(seen.revealed).toBe(true);
+    expect(seen.holeCards).toHaveLength(2);
+    // A fresh hand clears the reveal flag again.
+    startHand(t);
+    expect(t.seats[folded].revealed).toBe(false);
+  });
+});
+
+describe("7-2 rule", () => {
+  it("pays an offsuit-7-2 winner from every other player", () => {
+    const t = seed("full-deal", [1000, 1000, 1000]);
+    t.sevenDeuce = 25;
+    startHand(t);
+    // Everyone holds offsuit 7-2, so whoever wins triggers the rule.
+    t.seats.forEach((s) => {
+      s.holeCards = [
+        { rank: "7", suit: "spades" },
+        { rank: "2", suit: "hearts" },
+      ];
+    });
+    // 3-handed: the dealer is UTG and acts first, having posted no blind.
+    const utg = t.currentActorIndex;
+    applyAction(t, t.currentActorIndex, { type: "fold" });
+    applyAction(t, t.currentActorIndex, { type: "fold" });
+    expect(t.round).toBe("waiting");
+    expect(t.seats.reduce((n, s) => n + s.chips, 0)).toBe(3000); // conserved
+    expect(t.seats[utg].chips).toBe(975); // folded with no blind, paid 25 to winner
+  });
+
+  it("does nothing when the winner isn't holding 7-2", () => {
+    const t = seed("full-deal", [1000, 1000, 1000]);
+    t.sevenDeuce = 25;
+    startHand(t);
+    // No one holds 7-2, so the rule never fires.
+    t.seats.forEach((s) => {
+      s.holeCards = [
+        { rank: "A", suit: "spades" },
+        { rank: "K", suit: "spades" },
+      ];
+    });
+    const utg = t.currentActorIndex;
+    applyAction(t, t.currentActorIndex, { type: "fold" });
+    applyAction(t, t.currentActorIndex, { type: "fold" });
+    // utg folded preflop with no blind and no 7-2 win anywhere → untouched.
+    expect(t.seats[utg].chips).toBe(1000);
+  });
+});
+
+describe("live pot breakdown", () => {
+  it("splits into a main pot and a side pot once a player is all-in", () => {
+    const t = seed("full-deal", [50, 1000, 1000]);
+    // P0 all-in for 50; P1 and P2 keep betting to 200 each.
+    t.seats[0].committed = 50;
+    t.seats[0].status = "all-in";
+    t.seats[1].committed = 200;
+    t.seats[1].status = "active";
+    t.seats[2].committed = 200;
+    t.seats[2].status = "active";
+    t.pot = 450;
+    const pots = potBreakdown(t);
+    expect(pots).toEqual([
+      { amount: 150, eligibleSeatIndexes: [0, 1, 2] }, // main: 50×3
+      { amount: 300, eligibleSeatIndexes: [1, 2] }, // side: 150×2
+    ]);
+  });
+
+  it("is empty between hands", () => {
+    const t = seed("full-deal", [1000, 1000]);
+    expect(potBreakdown(t)).toEqual([]); // pot is 0
+  });
+
+  it("does not split on uneven bets when nobody is all-in", () => {
+    const t = seed("full-deal", [1000, 1000, 1000]);
+    // Blinds posted / an uncalled bet — uneven commitments, but no all-in.
+    t.seats[0].committed = 10;
+    t.seats[0].status = "active";
+    t.seats[1].committed = 200;
+    t.seats[1].status = "active";
+    t.seats[2].committed = 0;
+    t.pot = 210;
+    expect(potBreakdown(t)).toEqual([]);
+  });
+});
+
+describe("buy-ins and host chip control", () => {
+  it("tracks buy-ins so the recap shows true up/down", () => {
+    const t = seed("full-deal", [1000, 1000]);
+    t.seats[0].chips = 0; // P0 busted out
+    // P0 takes a 1000 rebuy via the host's buy-in offer.
+    offerBuyIn(t, 0, 1000);
+    respondBuyIn(t, "s0", true);
+    expect(t.seats[0].chips).toBe(1000);
+    expect(t.seats[0].buyInTotal).toBe(2000); // initial + rebuy
+    // P1 won 500 off P0 over the night (simulate by moving chips).
+    t.seats[1].chips = 1500;
+    const recap = buildRecap(t);
+    const p0 = recap.standings.find((s) => s.sessionId === "s0")!;
+    const p1 = recap.standings.find((s) => s.sessionId === "s1")!;
+    expect(p0.buyIn).toBe(2000);
+    expect(p0.netChips).toBe(1000 - 2000); // down 1000
+    expect(p1.netChips).toBe(1500 - 1000); // up 500
+  });
+
+  it("offers a buy-in the player must accept", () => {
+    const t = seed("full-deal", [1000, 1000]);
+    t.seats[0].chips = 0;
+    offerBuyIn(t, 0, 750);
+    expect(t.pendingBuyIns["s0"]).toBe(750);
+    // declined: nothing changes
+    respondBuyIn(t, "s0", false);
+    expect(t.seats[0].chips).toBe(0);
+    expect(t.pendingBuyIns["s0"]).toBeUndefined();
+    // offered again and accepted
+    offerBuyIn(t, 0, 750);
+    respondBuyIn(t, "s0", true);
+    expect(t.seats[0].chips).toBe(750);
+    expect(t.seats[0].buyInTotal).toBe(1750);
+  });
+
+  it("doesn't drop a mid-hand buy-in into the live hand", () => {
+    const t = seed("full-deal", [1000, 1000, 1000]);
+    t.seats[0].chips = 0; // P0 is broke and won't be dealt
+    startHand(t); // P0 sits out this hand (no cards)
+    expect(t.seats[0].status).toBe("sitting-out");
+    offerBuyIn(t, 0, 1000);
+    respondBuyIn(t, "s0", true);
+    // Bought in, but must NOT be active/holding cards in the current hand.
+    expect(t.seats[0].chips).toBe(1000);
+    expect(t.seats[0].status).toBe("sitting-out");
+    expect(t.seats[0].holeCards).toBeNull();
+    // Finish the hand, then they're dealt in next hand.
+    while (t.round !== "waiting") {
+      const i = t.currentActorIndex;
+      if (i < 0) break;
+      const toCall = Math.max(...t.seats.map((s) => s.currentBet)) - t.seats[i].currentBet;
+      applyAction(t, i, toCall > 0 ? { type: "call" } : { type: "check" });
+    }
+    startHand(t);
+    expect(t.seats[0].status).not.toBe("sitting-out");
+    expect(t.seats[0].holeCards).not.toBeNull();
+  });
+
+  it("busts broke players to spectator and only an accepted buy-in revives them", () => {
+    const t = seed("chips-only", [100, 100, 100]);
+    t.sevenDeuce = 100;
+    // P1 wins with 7-2; P0 and P2 each pay 100 → both hit 0 chips.
+    t.round = "showdown";
+    t.pot = 0;
+    t.seats.forEach((s) => (s.status = "active"));
+    awardPot(t, [1], undefined, true); // ends the hand → busts the broke ones
+    expect(t.seats[0].status).toBe("busted");
+    expect(t.seats[2].status).toBe("busted");
+    expect(t.seats[1].status).not.toBe("busted");
+    // Busted players still show in the recap (so they see how far down they are).
+    expect(buildRecap(t).standings.some((s) => s.sessionId === "s0")).toBe(true);
+    // A declined offer leaves them busted.
+    offerBuyIn(t, 0, 100);
+    respondBuyIn(t, "s0", false);
+    expect(t.seats[0].status).toBe("busted");
+    // Accepted between hands → back in, active and dealt next hand.
+    offerBuyIn(t, 0, 100);
+    respondBuyIn(t, "s0", true);
+    expect(t.seats[0].chips).toBe(100);
+    expect(t.seats[0].status).toBe("active");
+  });
+});
+
+describe("host transfer", () => {
+  it("hands host to a viable seat when the host busts out, no-op otherwise", () => {
+    const t = seed("chips-only", [1000, 1000]);
+    expect(reassignHostIfNeeded(t)).toBeNull(); // host fine → unchanged
+    expect(t.hostSessionId).toBe("s0");
+
+    t.seats[0].status = "busted"; // host out of chips, not buying back
+    expect(reassignHostIfNeeded(t)).toBe("P1");
+    expect(t.hostSessionId).toBe("s1");
+  });
+});
+
+describe("7-2 rule changes", () => {
+  it("defers a mid-hand change to the next hand, applies it immediately between hands", () => {
+    const t = seed("chips-only", [1000, 1000]);
+    startHand(t); // round is now preflop — a hand is live
+    setSevenDeuce(t, 100);
+    expect(t.sevenDeuce).toBe(0); // current hand untouched
+    expect(t.pendingSevenDeuce).toBe(100);
+
+    t.round = "waiting"; // hand ends
+    startHand(t); // next hand picks up the pending change
+    expect(t.sevenDeuce).toBe(100);
+    expect(t.pendingSevenDeuce).toBeNull();
+
+    // between hands the change is live right away
+    t.round = "waiting";
+    setSevenDeuce(t, 0);
+    expect(t.sevenDeuce).toBe(0);
+    expect(t.pendingSevenDeuce).toBeNull();
+  });
 });
 
 describe("chips-only mode", () => {
@@ -108,6 +330,24 @@ describe("chips-only mode", () => {
     expect(t.round).toBe("waiting");
     expect(t.seats.reduce((n, s) => n + s.chips, 0)).toBe(2000); // conserved
     expect(t.seats[1].chips).toBeGreaterThan(t.seats[0].chips); // winner ahead
+  });
+
+  it("applies the host-declared 7-2 rule on award and announces it", () => {
+    const t = seed("chips-only", [980, 980, 980]);
+    t.sevenDeuce = 100;
+    // Hand at showdown: each put 20 in, pot 60.
+    t.round = "showdown";
+    t.pot = 60;
+    t.seats.forEach((s) => {
+      s.committed = 20;
+      s.status = "active";
+    });
+    const r = awardPot(t, [1], undefined, true);
+    expect(r.sevenDeuce).toEqual({ winners: ["P1"], perPlayer: 100 });
+    expect(t.seats[1].chips).toBe(1240); // 980 + 60 pot + 200 (7-2)
+    expect(t.seats[0].chips).toBe(880); // paid 100
+    expect(t.seats[2].chips).toBe(880); // paid 100
+    expect(t.seats.reduce((n, s) => n + s.chips, 0)).toBe(3000); // conserved
   });
 });
 
@@ -185,5 +425,19 @@ describe("rollback", () => {
     rollbackHand(t, 2); // undo hand 2 -> back to before hand 2 == after hand 1
     expect(t.seats.map((s) => s.chips)).toEqual(afterHand1);
     expect(t.handNumber).toBe(1);
+  });
+});
+
+describe("join queue", () => {
+  it("seats queued players FIFO into open chairs at the next hand", () => {
+    const t = seed("full-deal", [1000, 1000]); // 2 seats, both taken
+    t.maxSeats = 3;
+    t.seats.push(emptySeat()); // one open chair
+    enqueuePlayer(t, "qa", "QueuedA", "sockA");
+    enqueuePlayer(t, "qb", "QueuedB", "sockB");
+    drainQueue(t); // only one seat free -> A sits, B still waits
+    expect(seatBySession(t, "qa")).toBe(2);
+    expect(seatBySession(t, "qb")).toBe(-1);
+    expect(t.queue.map((q) => q.sessionId)).toEqual(["qb"]);
   });
 });

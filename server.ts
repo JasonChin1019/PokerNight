@@ -1,5 +1,4 @@
 import { createServer } from "http";
-import { parse } from "url";
 import next from "next";
 import { Server as SocketIOServer } from "socket.io";
 import { registerSocketHandlers } from "./lib/socket/handlers";
@@ -16,8 +15,8 @@ const handle = app.getRequestHandler();
 app.prepare().then(() => {
   const httpServer = createServer((req, res) => {
     try {
-      const parsedUrl = parse(req.url || "", true);
-      handle(req, res, parsedUrl);
+      // Let Next parse the URL itself — avoids the deprecated url.parse().
+      handle(req, res);
     } catch (err) {
       console.error("Error handling request", req.url, err);
       res.statusCode = 500;

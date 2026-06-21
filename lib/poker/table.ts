@@ -8,6 +8,7 @@ import {
   type CardPeekRequest,
   type SessionStats,
   type SeatStats,
+  type SidePot,
   type RequestCheekyBetPayload,
   type SessionRecapPayload,
   type RecapStanding,
@@ -42,6 +43,9 @@ export type CheekySettlement = {
   betId: string;
   bettorSessionId: string;
   opponentSessionId: string;
+  bettorNickname: string;
+  opponentNickname: string;
+  amount: number;
   bettorDelta: number; // chips gained(+)/lost(−) by the bettor
   opponentDelta: number;
   result: NonNullable<CheekyBet["result"]>;
@@ -54,6 +58,7 @@ export type EngineResult = {
   logs: string[];
   showdown?: ShowdownResult;
   cheeky?: CheekySettlement[];
+  sevenDeuce?: { winners: string[]; perPlayer: number }; // 7-2 rule fired this hand
 };
 
 // ---------- creation ----------
@@ -67,6 +72,7 @@ export type CreateOpts = {
   smallBlind: number;
   bigBlind: number;
   turnMs?: number; // 0 = no timer; undefined = default
+  sevenDeuce?: number; // 7-2 rule payout per player; 0/undefined = off
 };
 
 export function createTable(o: CreateOpts): Table {
@@ -77,15 +83,19 @@ export function createTable(o: CreateOpts): Table {
     maxSeats: Math.min(9, Math.max(2, o.maxSeats)),
     seats: Array.from({ length: Math.min(9, Math.max(2, o.maxSeats)) }, emptySeat),
     spectators: [],
+    queue: [],
     deck: [],
     communityCards: [],
     pot: 0,
-    sidePots: [],
     tipJar: 0,
     dealerIndex: -1,
+    sbIndex: -1,
+    bbIndex: -1,
     smallBlind: o.smallBlind,
     bigBlind: o.bigBlind,
     buyIn: o.buyIn,
+    sevenDeuce: o.sevenDeuce ?? 0,
+    pendingSevenDeuce: null,
     round: "waiting",
     currentActorIndex: -1,
     minRaise: o.bigBlind,
@@ -97,6 +107,7 @@ export function createTable(o: CreateOpts): Table {
     actionHistory: [],
     cheekyBets: [],
     cardPeekRequests: [],
+    pendingBuyIns: {},
     sessionStats: { handsPlayed: 0, biggestPot: null, perSeat: {} },
     createdAt: Date.now(),
   };
@@ -182,23 +193,29 @@ export function startHand(t: Table): EngineResult {
   const funded = occupiedIndexes(t).filter((i) => t.seats[i].chips > 0);
   if (funded.length < 2) throw new Error("Need at least 2 players with chips.");
 
-  // Reset every occupied seat for the new hand (stacks untouched).
+  // Reset every occupied seat for the new hand (stacks untouched). Busted
+  // players stay off the table until they accept a buy-in.
   for (const s of t.seats) {
-    if (s.status === "empty") continue;
+    if (s.status === "empty" || s.status === "busted") continue;
     s.currentBet = 0;
     s.committed = 0;
     s.hasActed = false;
     s.holeCards = null;
+    s.revealed = false;
     s.status = s.chips > 0 ? "active" : "sitting-out";
   }
   t.pot = 0;
-  t.sidePots = [];
   t.communityCards = [];
   t.deck = [];
   t.round = "waiting";
   // Cheeky bets / peeks are per-hand; a fresh hand voids any stragglers.
   t.cheekyBets = [];
   t.cardPeekRequests = [];
+  // A rule change made during the previous hand takes effect now.
+  if (t.pendingSevenDeuce !== null) {
+    t.sevenDeuce = t.pendingSevenDeuce;
+    t.pendingSevenDeuce = null;
+  }
   t.handNumber++;
 
   // Snapshot the clean pre-blind/pre-deal state, then reset the per-action undo.
@@ -238,6 +255,8 @@ function postBlinds(t: Table, r: EngineResult) {
     bb = after[1];
     first = after[2]; // UTG
   }
+  t.sbIndex = sb;
+  t.bbIndex = bb;
   putChips(t, t.seats[sb], t.smallBlind);
   putChips(t, t.seats[bb], t.bigBlind);
   log(r, t, `${t.seats[sb].nickname} posts SB ${t.smallBlind}.`);
@@ -458,6 +477,17 @@ function contributions(t: Table): Contribution[] {
   }));
 }
 
+// Live pot breakdown for the snapshot. Only meaningful once a player is all-in
+// and others keep betting above them — otherwise uneven commitments (posted
+// blinds, an uncalled bet) would split into spurious "side pots". Returns []
+// in every other case so the UI just shows the single total pot.
+export function potBreakdown(t: Table): SidePot[] {
+  if (t.pot === 0) return []; // between hands
+  if (!t.seats.some((s) => s.status === "all-in")) return []; // no all-in → one pot
+  const pots = computeSidePots(contributions(t));
+  return pots.length > 1 ? pots : []; // all-in but nothing contested above it yet
+}
+
 function distribute(t: Table, amount: number, winners: number[]): PotAward {
   const share = Math.floor(amount / winners.length);
   let remainder = amount - share * winners.length;
@@ -471,7 +501,10 @@ function distribute(t: Table, amount: number, winners: number[]): PotAward {
 
 function awardByFold(t: Table, r: EngineResult, winnerIndex: number) {
   const amount = t.pot;
-  distribute(t, amount, [winnerIndex]);
+  const award = distribute(t, amount, [winnerIndex]);
+  // Surface the win like a showdown so the client shows the pot amount taken
+  // (felt "won X" badge + result overlay). No cards revealed — everyone mucked.
+  r.showdown = { reveals: [], potsAwarded: [award] };
   endHand(
     t,
     r,
@@ -508,6 +541,7 @@ function runShowdown(t: Table, r: EngineResult) {
 
   // Win-animation category = the strongest hand among seats that took chips.
   const winnerSeats = new Set(potsAwarded.flatMap((p) => p.winners));
+  for (const i of winnerSeats) t.seats[i].revealed = true; // auto-flip winner face-up in the waiting screen
   const winnerEvals = evals.filter((e) => winnerSeats.has(e.seatIndex));
   const topSeats = determineWinners(winnerEvals);
   const handCategory = winnerEvals.find((e) => topSeats.includes(e.seatIndex))?.name;
@@ -522,7 +556,8 @@ function runShowdown(t: Table, r: EngineResult) {
 export function awardPot(
   t: Table,
   winningSeatIndexes: number[],
-  handCategory?: string
+  handCategory?: string,
+  sevenDeuce = false // host declares the winner won with offsuit 7-2
 ): EngineResult {
   const r: EngineResult = { logs: [] };
   if (t.mode !== "chips-only") throw new Error("Pots are awarded automatically.");
@@ -542,7 +577,142 @@ export function awardPot(
     potsAwarded.push(distribute(t, t.pot, winningSeatIndexes));
   }
   r.showdown = { reveals: [], potsAwarded, handCategory };
+  if (sevenDeuce) applySevenDeuceManual(t, r, winningSeatIndexes);
   endHand(t, r, summarize(t, potsAwarded), winningSeatIndexes);
+  return r;
+}
+
+// 7-2 rule: a winner holding the worst starting hand — an offsuit 7 and 2 —
+// collects `t.sevenDeuce` chips from every other seated player.
+function isOffsuitSevenDeuce(cards: Card[] | null): boolean {
+  if (!cards || cards.length !== 2) return false;
+  const ranks = cards.map((c) => c.rank);
+  return ranks.includes("7") && ranks.includes("2") && cards[0].suit !== cards[1].suit;
+}
+
+// Transfer the 7-2 payout to one winner. ponytail: no cap — a player can go
+// negative and must buy back in (host's buy-in offer).
+function payoutSevenDeuce(t: Table, w: number) {
+  const win = t.seats[w];
+  let collected = 0;
+  t.seats.forEach((s, i) => {
+    if (i === w || s.status === "empty" || !s.sessionId) return;
+    s.chips -= t.sevenDeuce;
+    collected += t.sevenDeuce;
+  });
+  win.chips += collected;
+}
+
+// Record the announcement so the socket layer can pop the "everyone must pay X"
+// modal for the whole room.
+function announceSevenDeuce(t: Table, r: EngineResult, winners: number[]) {
+  if (!winners.length) return;
+  const names = winners.map((w) => t.seats[w].nickname);
+  r.sevenDeuce = { winners: names, perPlayer: t.sevenDeuce };
+  log(r, t, `${names.join(" & ")} won with 7-2 — everyone pays ${t.sevenDeuce} (7-2 rule).`);
+}
+
+// Full-deal: auto-detect winners who actually held offsuit 7-2.
+function applySevenDeuce(t: Table, r: EngineResult, winnerSeats: number[]) {
+  if (t.sevenDeuce <= 0 || t.mode !== "full-deal") return;
+  const fired: number[] = [];
+  for (const w of new Set(winnerSeats)) {
+    const win = t.seats[w];
+    if (!win || !isOffsuitSevenDeuce(win.holeCards)) continue;
+    payoutSevenDeuce(t, w);
+    fired.push(w);
+  }
+  announceSevenDeuce(t, r, fired);
+}
+
+// Chips-only: the host declares the 7-2 win when awarding (server never saw cards).
+function applySevenDeuceManual(t: Table, r: EngineResult, winnerSeats: number[]) {
+  if (t.sevenDeuce <= 0) return;
+  const fired = [...new Set(winnerSeats)].filter((w) => t.seats[w]);
+  for (const w of fired) payoutSevenDeuce(t, w);
+  announceSevenDeuce(t, r, fired);
+}
+
+// ---------- host chip management / buy-ins ----------
+
+// Host offers a player a buy-in; it sits pending until they accept or decline.
+export function offerBuyIn(t: Table, seatIndex: number, amount: number): EngineResult {
+  const r: EngineResult = { logs: [] };
+  const s = t.seats[seatIndex];
+  if (!s || s.status === "empty") throw new Error("No player in that seat.");
+  amount = Math.round(amount);
+  if (amount <= 0) throw new Error("Buy-in must be positive.");
+  t.pendingBuyIns[s.sessionId] = amount;
+  log(r, t, `Host offered ${s.nickname} a ${amount} buy-in.`);
+  return r;
+}
+
+// Player accepts/declines the host's pending buy-in offer.
+export function respondBuyIn(t: Table, sessionId: string, accept: boolean): EngineResult {
+  const r: EngineResult = { logs: [] };
+  const amount = t.pendingBuyIns[sessionId];
+  if (amount == null) return r; // nothing pending (or already handled)
+  delete t.pendingBuyIns[sessionId];
+  const i = t.seats.findIndex((s) => s.sessionId === sessionId && s.status !== "empty");
+  if (i < 0) return r;
+  const s = t.seats[i];
+  if (!accept) {
+    log(r, t, `${s.nickname} declined the buy-in.`);
+    return r;
+  }
+  s.chips += amount;
+  s.buyInTotal += amount;
+  // Bring a busted/sitting-out player back. Mid-hand they can't be dealt in —
+  // stay sitting-out so the next startHand seats them; don't drop them into a
+  // live hand with no cards.
+  if (s.chips > 0 && (s.status === "busted" || s.status === "sitting-out")) {
+    s.status = t.round === "waiting" ? "active" : "sitting-out";
+  }
+  log(r, t, `${s.nickname} bought in for ${amount}${t.round === "waiting" ? "" : " — in next hand"}.`);
+  return r;
+}
+
+// At hand end, anyone out of chips drops off the table (status "busted") and
+// spectates until the host offers a buy-in they accept. Keeps their seat record
+// so they stay addressable and still show in the end-of-game recap.
+function bustOutBrokePlayers(t: Table, r: EngineResult) {
+  for (const s of t.seats) {
+    if (s.status === "empty" || s.status === "busted" || !s.sessionId) continue;
+    if (s.chips > 0) continue;
+    s.status = "busted";
+    s.holeCards = null;
+    log(r, t, `${s.nickname} is out of chips — spectating until they buy back in.`);
+  }
+}
+
+// Hand the host badge to a viable seated player when the current host can no
+// longer run the game (busted out or left). Returns the new host's nickname,
+// or null if the host is still seated or nobody can take over.
+export function reassignHostIfNeeded(t: Table): string | null {
+  const cur = t.seats.find((s) => s.sessionId === t.hostSessionId);
+  if (cur && cur.status !== "empty" && cur.status !== "busted") return null;
+  const next = t.seats.find(
+    (s) => s.sessionId !== "" && s.status !== "empty" && s.status !== "busted"
+  );
+  if (!next) return null;
+  t.hostSessionId = next.sessionId;
+  return next.nickname;
+}
+
+// Host toggles/edits the 7-2 rule live. amount <= 0 turns it off. A change made
+// mid-hand is held in pendingSevenDeuce and applied at the next startHand, so it
+// never alters the hand already in progress.
+export function setSevenDeuce(t: Table, amount: number): EngineResult {
+  const r: EngineResult = { logs: [] };
+  const v = Math.max(0, Math.round(amount));
+  const label = v > 0 ? `7-2 rule set to ${v} chips` : "7-2 rule turned off";
+  if (t.round === "waiting") {
+    t.sevenDeuce = v;
+    log(r, t, `${label}.`);
+  } else {
+    t.pendingSevenDeuce = v;
+    log(r, t, `${label} — applies next hand.`);
+  }
   return r;
 }
 
@@ -579,15 +749,18 @@ function endHand(
     const s = t.seats[w];
     if (s && s.sessionId) ensureStat(t, s.sessionId, s.nickname).handsWon++;
   }
+  // ----- 7-2 rule: a winner holding offsuit 7-2 collects from everyone else -----
+  applySevenDeuce(t, r, winnerSeats);
   // ----- settle any folded-player side wagers for this hand -----
   settleCheekyBets(t, r);
 
   t.pot = 0;
-  t.sidePots = [];
   t.currentActorIndex = -1;
   t.turnDeadline = null;
   t.round = "waiting"; // donations allowed in the gap before the next hand
-  // Bust players become spectators in spirit (0 chips → sitting-out next hand).
+  bustOutBrokePlayers(t, r);
+  const newHost = reassignHostIfNeeded(t); // host busted out → keep the game runnable
+  if (newHost) log(r, t, `${newHost} is now the host.`);
   log(r, t, summary);
   const entry = t.handHistory.find((h) => h.handNumber === t.handNumber);
   if (entry) entry.summary = summary;
@@ -598,7 +771,7 @@ function endHand(
 function ensureStat(t: Table, sessionId: string, nickname: string): SeatStats {
   let stat = t.sessionStats.perSeat[sessionId];
   if (!stat) {
-    stat = { nickname, handsWon: 0, foldCount: 0, netChips: 0, cheekyBetsWon: 0 };
+    stat = { nickname, handsWon: 0, foldCount: 0, cheekyBetsWon: 0 };
     t.sessionStats.perSeat[sessionId] = stat;
   }
   stat.nickname = nickname; // keep latest nickname
@@ -617,7 +790,8 @@ export function buildRecap(t: Table): SessionRecapPayload {
         sessionId: s.sessionId,
         nickname: s.nickname,
         chips: s.chips,
-        netChips: s.chips - t.buyIn,
+        buyIn: s.buyInTotal,
+        netChips: s.chips - s.buyInTotal,
         handsWon: stat?.handsWon ?? 0,
         foldCount: stat?.foldCount ?? 0,
         cheekyBetsWon: stat?.cheekyBetsWon ?? 0,
@@ -659,8 +833,41 @@ export function undoLastAction(t: Table): EngineResult {
   const r: EngineResult = { logs: [] };
   const prev = t.actionHistory.pop();
   if (!prev) throw new Error("Nothing to undo this hand.");
+  // Whatever log lines exist now but not in the restored state are exactly the
+  // action(s) being reverted — surface them so the host sees what changed.
+  const reverted = t.handLog.slice(prev.handLog.length).join(" ").trim();
   Object.assign(t, prev); // prev lacks handHistory/actionHistory, so those survive
-  log(r, t, "Host undid the last action.");
+  log(r, t, reverted ? `Host undid: ${reverted}` : "Host undid the last action.");
+  return r;
+}
+
+// Swap the contents of two seats (move a player, or trade two players). Only
+// between hands — mid-hand it would scramble bets, the button and turn order.
+export function swapSeats(t: Table, a: number, b: number): EngineResult {
+  const r: EngineResult = { logs: [] };
+  if (t.round !== "waiting")
+    throw new Error("You can only rearrange seats between hands.");
+  if (a === b || a < 0 || b < 0 || a >= t.seats.length || b >= t.seats.length)
+    throw new Error("Pick two different seats.");
+  const before = `${t.seats[a].nickname || "Empty"}`;
+  const after = `${t.seats[b].nickname || "Empty"}`;
+  [t.seats[a], t.seats[b]] = [t.seats[b], t.seats[a]];
+  log(r, t, `Host rearranged seats ${a + 1} (${after}) ↔ ${b + 1} (${before}).`);
+  return r;
+}
+
+// A player flips their own hand face-up for the whole table, between hands
+// (full-deal only). Cards still sit on the seat until the next startHand clears
+// them, so this just marks them public; buildSnapshot then sends them to all.
+export function revealHand(t: Table, seatIndex: number): EngineResult {
+  const r: EngineResult = { logs: [] };
+  if (t.mode !== "full-deal") throw new Error("No dealt cards to reveal.");
+  if (t.round !== "waiting") throw new Error("You can only reveal between hands.");
+  const s = t.seats[seatIndex];
+  if (!s || !s.holeCards) throw new Error("You have no hand to reveal.");
+  if (s.revealed) return r; // already shown — no-op
+  s.revealed = true;
+  log(r, t, `${s.nickname} revealed their hand.`);
   return r;
 }
 
@@ -694,7 +901,6 @@ export function donateChips(
 
 // ---------- cheeky bets (full-deal only, build prompt §11) ----------
 
-const genId = () => randomUUID();
 const foldedNow = (s: Seat | undefined) => !!s && s.status === "folded";
 
 export function requestCheekyBet(
@@ -726,7 +932,7 @@ export function requestCheekyBet(
   );
   if (dupe) throw new Error("There's already a pending bet with them.");
   const bet: CheekyBet = {
-    id: genId(),
+    id: randomUUID(),
     handNumber: t.handNumber,
     bettorSeatIndex,
     opponentSeatIndex: p.opponentSeatIndex,
@@ -846,6 +1052,9 @@ function settleCheekyBets(t: Table, r: EngineResult): CheekySettlement[] {
       betId: bet.id,
       bettorSessionId: bettor.sessionId,
       opponentSessionId: opp.sessionId,
+      bettorNickname: bettor.nickname,
+      opponentNickname: opp.nickname,
+      amount: a,
       bettorDelta,
       opponentDelta,
       result,
@@ -878,7 +1087,7 @@ export function requestCardPeek(
   );
   if (dupe) throw new Error("You already asked to see their hand.");
   const peek: CardPeekRequest = {
-    id: genId(),
+    id: randomUUID(),
     handNumber: t.handNumber,
     requesterSeatIndex,
     targetSeatIndex,

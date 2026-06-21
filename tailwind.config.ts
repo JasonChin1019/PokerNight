@@ -76,6 +76,30 @@ const config: Config = {
           "0%,100%": { transform: "rotateY(0deg)" },
           "50%": { transform: "rotateY(180deg)" },
         },
+        // one-shot reveal: card flips around from edge to face
+        "pn-flip-in": {
+          "0%": { transform: "rotateY(-180deg)", opacity: "0" },
+          "50%": { opacity: "1" },
+          "100%": { transform: "rotateY(0deg)", opacity: "1" },
+        },
+        // board deal: card travels at full size as a back, then flips face-up.
+        // Pure rotation, no scale — so the rank/suit never change size visually
+        // (relies on a working 3D context + backface-visibility on the faces).
+        "pn-deal-card": {
+          "0%,45%": { transform: "rotateY(0deg)" },
+          "100%": { transform: "rotateY(180deg)" },
+        },
+        // burnt card going up in flames at the burn spot
+        "pn-burn": {
+          "0%": { opacity: "1", filter: "brightness(1)" },
+          "55%": { opacity: "1", filter: "brightness(.75) sepia(1) saturate(4) hue-rotate(-18deg)" },
+          "100%": { opacity: "0", transform: "scale(.65) translateY(7px)", filter: "brightness(.2)" },
+        },
+        "pn-flame": {
+          "0%": { opacity: "0", transform: "translateY(3px) scale(.6)" },
+          "35%": { opacity: "1" },
+          "100%": { opacity: "0", transform: "translateY(-18px) scale(1.15)" },
+        },
         "pn-bounce": {
           "0%,100%": { transform: "translateY(0)" },
           "50%": { transform: "translateY(-22px)" },
@@ -145,6 +169,8 @@ const config: Config = {
         "pn-up": "pn-up .4s ease",
         "pn-pop": "pn-pop .3s ease",
         "pn-flip": "pn-flip 1.2s ease infinite",
+        "pn-flip-in": "pn-flip-in .6s ease both",
+        "pn-deal-card": "pn-deal-card 520ms ease-out both",
         "pn-bounce": "pn-bounce .9s ease infinite",
         "pn-glow": "pn-glow 1.4s ease infinite",
         "pn-flash": "pn-flash 2.5s ease infinite",
