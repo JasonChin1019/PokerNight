@@ -11,6 +11,7 @@ import {
   hostBuyIn,
   transferHost,
   setSevenDeuce,
+  setMinRaise,
   requestCheekyBet,
   respondCheekyBet,
   offerBuyIn,
@@ -431,6 +432,101 @@ describe("cheeky bets", () => {
     );
     // Live table board is never mutated by settlement.
     expect(t.communityCards.length).toBeLessThanOrEqual(5);
+  });
+});
+
+describe("creation validation", () => {
+  const base = {
+    roomCode: "T",
+    hostSessionId: "s0",
+    mode: "full-deal" as const,
+    maxSeats: 2,
+    buyIn: 1000,
+    smallBlind: 10,
+    bigBlind: 20,
+  };
+  it("rejects a big blind below the small blind", () => {
+    expect(() => createTable({ ...base, smallBlind: 50, bigBlind: 20 })).toThrow(/big blind/i);
+  });
+  it("rejects non-positive or non-integer money", () => {
+    expect(() => createTable({ ...base, buyIn: 0 })).toThrow();
+    expect(() => createTable({ ...base, smallBlind: -5 })).toThrow();
+    expect(() => createTable({ ...base, bigBlind: 2.5 })).toThrow();
+  });
+  it("defaults the min raise to the big blind", () => {
+    expect(createTable(base).minRaiseDefault).toBe(20);
+  });
+  it("honours a custom min raise below the small blind", () => {
+    const t = createTable({ ...base, minRaise: 5 });
+    expect(t.minRaiseDefault).toBe(5);
+    expect(t.minRaise).toBe(5);
+  });
+});
+
+describe("configurable min raise / min bet", () => {
+  it("setMinRaise changes the floor live between hands", () => {
+    const t = seed("full-deal", [1000, 1000]);
+    setMinRaise(t, 5);
+    expect(t.minRaiseDefault).toBe(5);
+    expect(t.minRaise).toBe(5);
+    expect(() => setMinRaise(t, 0)).toThrow();
+  });
+
+  it("allows a post-flop bet below the small blind once configured", () => {
+    const t = seed("full-deal", [1000, 1000]); // SB 10 / BB 20
+    setMinRaise(t, 5); // floor set below the small blind
+    startHand(t);
+    // call/check down to the flop
+    let guard = 0;
+    while (t.round === "preflop" && guard++ < 10) {
+      const i = t.currentActorIndex;
+      const toCall = Math.max(...t.seats.map((s) => s.currentBet)) - t.seats[i].currentBet;
+      applyAction(t, i, toCall > 0 ? { type: "call" } : { type: "check" });
+    }
+    expect(t.round).toBe("flop");
+    const actor = t.currentActorIndex;
+    // Below the floor still rejected; a bet at the floor (5 < SB 10) is allowed.
+    expect(() => applyAction(t, actor, { type: "bet", amount: 4 })).toThrow(/Minimum bet/);
+    applyAction(t, actor, { type: "bet", amount: 5 });
+    expect(t.seats[actor].currentBet).toBe(5);
+  });
+});
+
+describe("card visibility", () => {
+  it("shows a player their own cards even after they fold", () => {
+    const t = seed("full-deal", [1000, 1000, 1000]);
+    startHand(t);
+    const folder = t.currentActorIndex;
+    applyAction(t, folder, { type: "fold" });
+    // Hand continues (2 left); the folder still sees their own hole cards.
+    expect(t.round).not.toBe("waiting");
+    expect(buildSnapshot(t, `s${folder}`).seats[folder].holeCards).toHaveLength(2);
+  });
+
+  it("reveals cheeky counterparties' cards to each other at showdown", () => {
+    const t = seed("full-deal", [1000, 1000]);
+    t.round = "showdown";
+    t.seats[0].status = "active";
+    t.seats[1].status = "folded";
+    t.seats[0].holeCards = [
+      { rank: "A", suit: "spades" },
+      { rank: "K", suit: "spades" },
+    ];
+    t.seats[1].holeCards = [
+      { rank: "7", suit: "hearts" },
+      { rank: "2", suit: "clubs" },
+    ];
+    t.cheekyBets.push({
+      id: "c1",
+      handNumber: t.handNumber,
+      bettorSeatIndex: 0,
+      opponentSeatIndex: 1,
+      bettorPrediction: "mine-better",
+      amount: 50,
+      status: "accepted",
+    });
+    // Seat 0 sees the folded opponent's cards because they share a cheeky bet.
+    expect(buildSnapshot(t, "s0").seats[1].holeCards).toHaveLength(2);
   });
 });
 

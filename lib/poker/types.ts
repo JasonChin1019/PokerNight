@@ -134,6 +134,7 @@ export type Table = {
   round: Round;
   currentActorIndex: number;
   minRaise: number;
+  minRaiseDefault: number; // host-configured floor for bets/raises; minRaise ratchets up from here each street
   turnMs: number; // per-turn time limit; 0 = no timer
   turnDeadline: number | null;
   handNumber: number;
@@ -211,7 +212,8 @@ export type RoomSnapshot = {
   bigBlind: number;
   buyIn: number;
   sevenDeuce: number; // 7-2 rule payout per player; 0 = off
-  minRaise: number;
+  minRaise: number; // live floor for this street (ratchets up as the round reopens)
+  minRaiseDefault: number; // host-configured floor; what the settings control edits
   handNumber: number;
   turnSeconds: number; // configured per-turn limit in seconds; 0 = no timer
   turnDeadline: number | null;
@@ -246,6 +248,7 @@ export type CreateRoomPayload = {
   buyIn: number;
   smallBlind: number;
   bigBlind: number;
+  minRaise?: number; // host-configured min bet/raise floor; defaults to bigBlind
   turnSeconds?: number; // per-turn time limit; 0 or undefined handled by server default
   sevenDeuce?: number; // 7-2 rule payout per player; 0/undefined = off
 };

@@ -15,6 +15,7 @@ import {
   getRoom,
   buildSnapshot,
   seatPlayer,
+  firstEmptySeat,
   addSpectator,
   removeSpectator,
   seatBySession,
@@ -41,6 +42,7 @@ import {
   revealHand,
   endGame,
   setSevenDeuce,
+  setMinRaise,
   offerBuyIn,
   respondBuyIn,
   hostBuyIn,
@@ -66,6 +68,7 @@ export function registerSocketHandlers(io: Server) {
           buyIn: p.buyIn,
           smallBlind: p.smallBlind,
           bigBlind: p.bigBlind,
+          minRaise: p.minRaise,
           turnMs: p.turnSeconds != null ? p.turnSeconds * 1000 : undefined,
           sevenDeuce: p.sevenDeuce,
         });
@@ -89,13 +92,18 @@ export function registerSocketHandlers(io: Server) {
           seatPlayer(t, p.sessionId, p.nickname, socket.id);
           removeSpectator(t, p.sessionId);
           removeFromQueue(t, p.sessionId);
-        } else if (t.handNumber > 0) {
-          // game already underway: queue + spectate until the next hand
+        } else if (t.round !== "waiting") {
+          // a hand is in progress — can't deal in mid-hand; queue until it ends
           addSpectator(t, p.sessionId, p.nickname, socket.id);
           enqueuePlayer(t, p.sessionId, p.nickname, socket.id);
-        } else {
+        } else if (firstEmptySeat(t) >= 0) {
+          // table is idle between hands and a chair is open — sit them now
           seatPlayer(t, p.sessionId, p.nickname, socket.id);
           removeSpectator(t, p.sessionId);
+        } else {
+          // idle but full — wait for the next opening
+          addSpectator(t, p.sessionId, p.nickname, socket.id);
+          enqueuePlayer(t, p.sessionId, p.nickname, socket.id);
         }
         bind(socket, t.roomCode, p.sessionId);
         ack?.({ ok: true, roomCode: t.roomCode });
@@ -208,6 +216,11 @@ export function registerSocketHandlers(io: Server) {
         });
         return res;
       })
+    );
+
+    // host changes the min bet/raise floor mid-game
+    socket.on("set_min_raise", (p: { amount: number }) =>
+      run(io, socket, true, (t) => setMinRaise(t, p.amount))
     );
 
     // host offers a player a buy-in; player accepts/declines on their screen

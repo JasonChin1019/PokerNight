@@ -71,11 +71,21 @@ export type CreateOpts = {
   buyIn: number;
   smallBlind: number;
   bigBlind: number;
+  minRaise?: number; // host-configured min bet/raise floor; defaults to bigBlind
   turnMs?: number; // 0 = no timer; undefined = default
   sevenDeuce?: number; // 7-2 rule payout per player; 0/undefined = off
 };
 
 export function createTable(o: CreateOpts): Table {
+  const posInt = (n: number, label: string) => {
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`${label} must be a whole number above 0.`);
+  };
+  posInt(o.buyIn, "Buy-in");
+  posInt(o.smallBlind, "Small blind");
+  posInt(o.bigBlind, "Big blind");
+  if (o.bigBlind < o.smallBlind) throw new Error("Big blind can't be smaller than the small blind.");
+  const minRaise = o.minRaise ?? o.bigBlind;
+  posInt(minRaise, "Min raise");
   return {
     roomCode: o.roomCode,
     hostSessionId: o.hostSessionId,
@@ -98,7 +108,8 @@ export function createTable(o: CreateOpts): Table {
     pendingSevenDeuce: null,
     round: "waiting",
     currentActorIndex: -1,
-    minRaise: o.bigBlind,
+    minRaise,
+    minRaiseDefault: minRaise,
     turnMs: o.turnMs ?? TURN_MS,
     turnDeadline: null,
     handNumber: 0,
@@ -237,7 +248,7 @@ export function startHand(t: Table): EngineResult {
 
   postBlinds(t, r);
   t.round = "preflop";
-  t.minRaise = t.bigBlind;
+  t.minRaise = t.minRaiseDefault;
   log(r, t, `Hand #${t.handNumber} started.`);
   return r;
 }
@@ -307,8 +318,8 @@ export function applyAction(
       if (hb > 0) throw new Error("There's already a bet — raise instead.");
       const amount = action.amount ?? 0;
       const allIn = amount >= seat.currentBet + seat.chips;
-      if (!allIn && amount < t.bigBlind)
-        throw new Error(`Minimum bet is ${t.bigBlind}.`);
+      if (!allIn && amount < t.minRaiseDefault)
+        throw new Error(`Minimum bet is ${t.minRaiseDefault}.`);
       const paid = putChips(t, seat, amount - seat.currentBet);
       t.minRaise = seat.currentBet;
       reopen(t, seatIndex);
@@ -390,7 +401,7 @@ function settle(t: Table, r: EngineResult) {
     s.currentBet = 0;
     if (canAct(s)) s.hasActed = false;
   }
-  t.minRaise = t.bigBlind;
+  t.minRaise = t.minRaiseDefault;
   t.currentActorIndex = -1;
   t.turnDeadline = null;
 
@@ -445,7 +456,7 @@ export function advanceStreet(t: Table): EngineResult {
     s.currentBet = 0;
     if (canAct(s)) s.hasActed = false;
   }
-  t.minRaise = t.bigBlind;
+  t.minRaise = t.minRaiseDefault;
   const order: Record<string, Table["round"]> = {
     preflop: "flop",
     flop: "turn",
@@ -744,6 +755,18 @@ export function setSevenDeuce(t: Table, amount: number): EngineResult {
     t.pendingSevenDeuce = v;
     log(r, t, `${label} — applies next hand.`);
   }
+  return r;
+}
+
+// Host changes the min bet/raise floor live. Takes effect from the next street
+// (or hand); we don't lower the current street's ratcheted minRaise mid-round.
+export function setMinRaise(t: Table, amount: number): EngineResult {
+  const r: EngineResult = { logs: [] };
+  const v = Math.round(amount);
+  if (!Number.isInteger(v) || v <= 0) throw new Error("Min raise must be a whole number above 0.");
+  t.minRaiseDefault = v;
+  if (t.round === "waiting") t.minRaise = v;
+  log(r, t, `Min raise set to ${v} chips.`);
   return r;
 }
 

@@ -162,10 +162,27 @@ export function buildSnapshot(t: Table, viewerSessionId: string): RoomSnapshot {
     // Busted seats render as empty chairs — the player has left the table.
     const occupied = s.status !== "empty" && s.status !== "busted" && s.sessionId !== "";
     const mine = occupied && s.sessionId === viewerSessionId;
-    // A seat's cards show if: it's mine/spectator-X-ray (and not folded), OR the
-    // player voluntarily revealed their hand between hands (folded or not).
+    // Cheeky-bet counterparties see each other's cards at showdown so the side
+    // bet's outcome is visible even if one of them folded the main pot.
+    const cheekyReveal =
+      t.round === "showdown" &&
+      mySeat >= 0 &&
+      t.cheekyBets.some(
+        (b) =>
+          (b.status === "accepted" || b.status === "settled") &&
+          ((b.bettorSeatIndex === mySeat && b.opponentSeatIndex === i) ||
+            (b.opponentSeatIndex === mySeat && b.bettorSeatIndex === i))
+      );
+    // A seat's cards show if: it's mine — always while a hand is live, even after
+    // folding (between hands a folded hand stays hidden until I opt to reveal);
+    // spectator X-ray on a live hand; the player voluntarily revealed; or it's my
+    // cheeky counterparty at showdown.
     const reveal =
-      occupied && (s.revealed || ((mine || seeAllCards) && s.status !== "folded"));
+      occupied &&
+      (s.revealed ||
+        (mine && (s.status !== "folded" || t.round !== "waiting")) ||
+        (seeAllCards && s.status !== "folded") ||
+        cheekyReveal);
     return {
       seatIndex: i,
       occupied,
@@ -229,6 +246,7 @@ export function buildSnapshot(t: Table, viewerSessionId: string): RoomSnapshot {
     buyIn: t.buyIn,
     sevenDeuce: t.sevenDeuce,
     minRaise: t.minRaise,
+    minRaiseDefault: t.minRaiseDefault,
     handNumber: t.handNumber,
     turnSeconds: Math.round(t.turnMs / 1000),
     turnDeadline: t.turnDeadline,

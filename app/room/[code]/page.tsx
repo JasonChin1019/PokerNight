@@ -7,6 +7,7 @@ import QRCode from "qrcode";
 import { getSocket, getSessionId, getNickname } from "@/lib/client/socket";
 import { PlayingCard, CardBack } from "@/components/Card";
 import { WinAnimation } from "@/components/WinAnimation";
+import NumField from "@/components/NumField";
 import { getAnimationTier } from "@/lib/poker/animation";
 import type {
   Card,
@@ -1522,32 +1523,47 @@ function TableView({
 // Active cheeky bets the viewer is part of, parked in the middle of the felt:
 // two avatars with a ↔ arrow and the stake between them. Stacks if several.
 function CheekyBetTags({ snap }: { snap: RoomSnapshot }) {
-  const live = snap.cheekyBets.filter((b) => b.status === "accepted");
+  // Keep accepted bets pinned to the felt; at showdown also keep settled ones up
+  // (with their result) so the outcome doesn't vanish the instant they resolve.
+  const live = snap.cheekyBets.filter(
+    (b) => b.status === "accepted" || (b.status === "settled" && snap.round === "showdown")
+  );
   if (live.length === 0) return null;
   return (
     <div className="pointer-events-none absolute left-1/2 top-[60%] z-[7] flex w-full -translate-x-1/2 flex-col items-center gap-1.5">
       {live.map((b) => {
         const bettor = snap.seats[b.bettorSeatIndex];
         const opp = snap.seats[b.opponentSeatIndex];
+        const outcome =
+          b.status !== "settled" || !b.result
+            ? null
+            : b.result === "push"
+            ? "Push — stakes returned"
+            : `${(b.result === "bettor-won" ? bettor : opp).nickname} wins ${fmt(b.amount)}`;
         return (
           <div
             key={b.id}
-            className="flex animate-pn-pop items-center gap-2 rounded-full border border-amber/30 bg-black/55 px-2.5 py-1 shadow-[0_6px_16px_rgba(0,0,0,.45)]"
+            className="flex animate-pn-pop flex-col items-center gap-1 rounded-2xl border border-amber/30 bg-black/55 px-3 py-1.5 shadow-[0_6px_16px_rgba(0,0,0,.45)]"
           >
-            <div className="flex flex-col items-center">
-              <Avatar name={bettor.nickname} className="h-6 w-6 rounded-full text-[10px]" />
-              <span className="mt-0.5 text-[9px] font-bold text-cream-2">{bettor.nickname}</span>
+            <div className="flex items-center gap-2">
+              <div className="flex flex-col items-center">
+                <Avatar name={bettor.nickname} className="h-6 w-6 rounded-full text-[10px]" />
+                <span className="mt-0.5 text-[9px] font-bold text-cream-2">{bettor.nickname}</span>
+              </div>
+              <div className="flex flex-col items-center px-0.5">
+                <span className="text-[13px] leading-none text-amber">↔</span>
+                <span className="mt-0.5 font-display text-[11px] font-bold leading-none text-amber-soft">
+                  {fmt(b.amount)}
+                </span>
+              </div>
+              <div className="flex flex-col items-center">
+                <Avatar name={opp.nickname} className="h-6 w-6 rounded-full text-[10px]" />
+                <span className="mt-0.5 text-[9px] font-bold text-cream-2">{opp.nickname}</span>
+              </div>
             </div>
-            <div className="flex flex-col items-center px-0.5">
-              <span className="text-[13px] leading-none text-amber">↔</span>
-              <span className="mt-0.5 font-display text-[11px] font-bold leading-none text-amber-soft">
-                {fmt(b.amount)}
-              </span>
-            </div>
-            <div className="flex flex-col items-center">
-              <Avatar name={opp.nickname} className="h-6 w-6 rounded-full text-[10px]" />
-              <span className="mt-0.5 text-[9px] font-bold text-cream-2">{opp.nickname}</span>
-            </div>
+            {outcome && (
+              <span className="font-display text-[10px] font-bold text-amber">{outcome}</span>
+            )}
           </div>
         );
       })}
@@ -2600,7 +2616,7 @@ function TipModal({
             </button>
           ))}
         </div>
-        <div className="mb-3.5 flex gap-2.5">
+        <div className="mb-2.5 flex gap-2.5">
           {[25, 50, 100].map((v) => (
             <button
               key={v}
@@ -2615,9 +2631,21 @@ function TipModal({
             </button>
           ))}
         </div>
+        <NumField
+          value={amount}
+          onChange={setAmount}
+          min={1}
+          max={me?.chips ?? undefined}
+          className={`input mb-1.5 font-display font-bold ${
+            [25, 50, 100].includes(amount) ? "text-cream-2" : "border-amber text-amber"
+          }`}
+        />
+        {me && amount > me.chips && (
+          <p className="mb-2 text-[12px] text-clay-soft">You only have {fmt(me.chips)} chips.</p>
+        )}
         <button
           onClick={send}
-          disabled={target === null}
+          disabled={target === null || amount <= 0 || !me || amount > me.chips}
           className="h-14 w-full rounded-2xl bg-amber font-display text-base font-bold text-amber-ink disabled:opacity-40"
         >
           Send {amount}
@@ -2641,9 +2669,11 @@ function RulesModal({
   const ro = !snap.youAreHost; // non-hosts can look, not touch
   const [on, setOn] = useState(snap.sevenDeuce > 0);
   const [amount, setAmount] = useState(snap.sevenDeuce > 0 ? snap.sevenDeuce : 50);
+  const [minR, setMinR] = useState(snap.minRaiseDefault);
 
   const save = () => {
     emit("set_seven_deuce", { amount: on ? Math.max(1, amount) : 0 });
+    if (minR !== snap.minRaiseDefault) emit("set_min_raise", { amount: Math.max(1, minR) });
     onClose();
   };
 
@@ -2693,6 +2723,27 @@ function RulesModal({
             />
           </div>
         )}
+        <div className="mt-5">
+          <div className="mb-1.5 text-[12.5px] font-semibold tracking-wide text-muted">
+            MIN RAISE / MIN BET
+            {ro && <span className="ml-1 text-muted">· {snap.minRaiseDefault}</span>}
+          </div>
+          {ro ? (
+            <div className="input font-display font-bold text-amber opacity-70">
+              {snap.minRaiseDefault}
+            </div>
+          ) : (
+            <NumField
+              value={minR}
+              onChange={setMinR}
+              min={1}
+              className="input font-display font-bold text-amber"
+            />
+          )}
+          <p className="mt-1.5 text-[12px] leading-snug text-muted">
+            Smallest bet or raise allowed — can be below the small blind. Applies from the next street.
+          </p>
+        </div>
         {ro ? (
           <p className="mt-5 text-center text-[12px] text-muted">Only the host can change rules.</p>
         ) : (

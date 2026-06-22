@@ -50,3 +50,14 @@ Path alias: `@/*` → repo root (tsconfig).
 ## Not shipped code
 
 `*.dc.html` and `support*.js` (and `pokernight-claude-*.md`) are Claude Design reference artifacts / build prompts, not part of the running app. Don't edit them to change app behavior, and don't treat the `(new design)` / `(new features)` copies as live source.
+
+TODO
+Add validations when creating games (BB cannot be smaller than SB)
+Number validations
+Custom needs to clear whole thing (backspace)
+Timer needs to have limits
+Add option to change min raise amount
+Make min bet be able to do less than small blind after the flop
+Player buy in mid way instantly joins the table instead of going to the queue
+Make tip custom
+Cheeky bet cards disappear after folding, and in showdown its not shown properly

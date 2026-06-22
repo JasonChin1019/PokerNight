@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { getSocket, getSessionId, getNickname, setNickname } from "@/lib/client/socket";
+import NumField from "@/components/NumField";
 
 export default function CreatePage() {
   const router = useRouter();
@@ -14,6 +15,7 @@ export default function CreatePage() {
   const [buyIn, setBuyIn] = useState(1000);
   const [smallBlind, setSmallBlind] = useState(10);
   const [bigBlind, setBigBlind] = useState(20);
+  const [minRaise, setMinRaise] = useState(20); // min bet/raise floor; can be < SB
   const [turnSeconds, setTurnSeconds] = useState(30); // 0 = no timer
   const [realCards, setRealCards] = useState(false);
   const [ruleOn, setRuleOn] = useState(false); // 7-2 rule toggle
@@ -24,6 +26,19 @@ export default function CreatePage() {
 
   function submit() {
     if (!nickname.trim()) return setErr("Pick a nickname first.");
+    for (const [v, label] of [
+      [buyIn, "Buy-in"],
+      [smallBlind, "Small blind"],
+      [bigBlind, "Big blind"],
+      [minRaise, "Min raise"],
+    ] as const) {
+      if (!Number.isInteger(v) || v <= 0)
+        return setErr(`${label} must be a whole number above 0.`);
+    }
+    if (bigBlind < smallBlind)
+      return setErr("Big blind can't be smaller than the small blind.");
+    if (turnSeconds !== 0 && (turnSeconds < 5 || turnSeconds > 300))
+      return setErr("Turn timer must be between 5 and 300 seconds, or Off.");
     setBusy(true);
     setErr("");
     setNickname(nickname.trim());
@@ -38,6 +53,7 @@ export default function CreatePage() {
         buyIn,
         smallBlind,
         bigBlind,
+        minRaise,
         turnSeconds,
         sevenDeuce,
       },
@@ -108,32 +124,42 @@ export default function CreatePage() {
         </Field>
 
         <Field label="BUY-IN CHIPS">
-          <input
-            type="number"
+          <NumField
             value={buyIn}
+            onChange={setBuyIn}
             min={1}
-            onChange={(e) => setBuyIn(Math.max(1, +e.target.value))}
             className="input font-display font-bold text-amber"
           />
         </Field>
 
         <Field label="BLINDS (SMALL / BIG)">
           <div className="flex gap-3">
-            <input
-              type="number"
+            <NumField
               value={smallBlind}
+              onChange={setSmallBlind}
               min={1}
-              onChange={(e) => setSmallBlind(Math.max(1, +e.target.value))}
               className="input font-display font-bold"
             />
-            <input
-              type="number"
+            <NumField
               value={bigBlind}
+              onChange={setBigBlind}
               min={1}
-              onChange={(e) => setBigBlind(Math.max(1, +e.target.value))}
               className="input font-display font-bold"
             />
           </div>
+        </Field>
+
+        <Field label="MIN RAISE / MIN BET">
+          <NumField
+            value={minRaise}
+            onChange={setMinRaise}
+            min={1}
+            className="input font-display font-bold"
+          />
+          <p className="mt-1.5 text-[12px] leading-snug text-muted">
+            Smallest bet or raise allowed. Can be set below the small blind for
+            tiny post-flop bets. Defaults to the big blind.
+          </p>
         </Field>
 
         <Field label="TURN TIMER">
@@ -155,12 +181,12 @@ export default function CreatePage() {
                 {label}
               </button>
             ))}
-            <input
-              type="number"
-              min={1}
+            <NumField
+              value={turnSeconds}
+              onChange={setTurnSeconds}
+              min={0}
+              max={300}
               placeholder="Custom"
-              value={[0, 30, 60].includes(turnSeconds) ? "" : turnSeconds}
-              onChange={(e) => setTurnSeconds(Math.max(0, Math.round(+e.target.value)))}
               className={`h-11 w-[88px] rounded-xl border bg-field px-2 text-center font-display text-sm font-bold outline-none focus:border-amber/50 ${
                 [0, 30, 60].includes(turnSeconds)
                   ? "border-white/12 text-cream-2"
@@ -234,11 +260,10 @@ export default function CreatePage() {
                   <div className="mb-1.5 text-[12.5px] font-semibold tracking-wide text-muted">
                     CHIPS FROM EACH PLAYER
                   </div>
-                  <input
-                    type="number"
-                    min={1}
+                  <NumField
                     value={ruleAmount}
-                    onChange={(e) => setRuleAmount(Math.max(1, +e.target.value))}
+                    onChange={setRuleAmount}
+                    min={1}
                     className="input font-display font-bold text-amber"
                   />
                 </div>
